@@ -1,0 +1,47 @@
+# CT模拟器所需Arduino库
+
+## 必需的库文件：
+
+1. **ModbusMaster** - Modbus RTU通信库
+   - 作者: 4-20ma
+   - 版本: 2.0.1 或更高
+   - 安装方法: Arduino IDE -> 工具 -> 管理库 -> 搜索 "ModbusMaster"
+
+2. **Adafruit MCP4725** - MCP4725 DAC控制库
+   - 作者: Adafruit
+   - 版本: 2.0.0 或更高
+   - 安装方法: Arduino IDE -> 工具 -> 管理库 -> 搜索 "Adafruit MCP4725"
+
+3. **Wire** - I2C通信库 (ESP32内置)
+   - ESP32核心库自带，无需额外安装
+
+## 安装步骤：
+
+### 方法一：通过Arduino IDE库管理器
+1. 打开Arduino IDE
+2. 选择 工具 -> 管理库
+3. 搜索 "ModbusMaster" 并安装
+
+### 方法二：手动下载安装
+1. 访问 https://github.com/4-20ma/ModbusMaster
+2. 下载ZIP文件
+3. Arduino IDE -> 项目 -> 加载库 -> 添加.ZIP库
+
+## ESP32开发板支持：
+
+确保已安装ESP32开发板包：
+1. 文件 -> 首选项 -> 附加开发板管理器网址
+2. 添加: https://dl.espressif.com/dl/package_esp32_index.json
+3. 工具 -> 开发板 -> 开发板管理器
+4. 搜索 "ESP32" 并安装 "ESP32 by Espressif Systems"
+
+## 编译配置：
+
+开发板设置：
+- 开发板: ESP32 Dev Module
+- CPU频率: 240MHz
+- Flash频率: 80MHz  
+- Flash模式: DIO
+- Flash大小: 4MB
+- 分区方案: Default 4MB with spiffs
+- 上传速度: 921600
