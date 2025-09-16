@@ -7,6 +7,8 @@
  * - 核心0 (实时核心): 专门负责DAC正弦波生成，确保200μs精确更新
  * - 核心1 (应用核心): 处理测试模式切换、状态打印等非实时任务
  * - 定点数数学: 避免实时路径中的浮点运算
+ * 
+ * 修正: 兼容ESP32 Arduino Core v3.x+ 的硬件定时器API
  */
 
 #include <Wire.h>
@@ -62,6 +64,9 @@ TaskHandle_t sineWaveTaskHandle = NULL;
 
 // 硬件定时器 (FreeRTOS任务通知方案)
 hw_timer_t * dacTimer = NULL;
+
+// 为中断服务程序(ISR)添加前向声明
+void IRAM_ATTR dacTimerISR();
 
 void setup() {
   Serial.begin(115200);
@@ -160,15 +165,22 @@ void initSineTable() {
   Serial.printf("正弦波查找表生成完成: %d 点\n", SINE_TABLE_SIZE);
 }
 
+// *** FIX: 更新为兼容ESP32 Core v3.x+ 的新版定时器API ***
 void initDacTimer() {
-  // 初始化硬件定时器用于精确DAC更新时序
-  dacTimer = timerBegin(0, 80, true);  // 定时器0，80分频，向上计数
-  timerAttachInterrupt(dacTimer, &dacTimerISR, true);  // 绑定中断服务程序
-  timerAlarmWrite(dacTimer, DAC_UPDATE_INTERVAL_US, true);  // 设置200μs间隔，自动重载
-  timerAlarmEnable(dacTimer);  // 启用定时器中断
+  // 计算所需的中断频率。200µs间隔 = 1,000,000 / 200 = 5000 Hz
+  uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
+
+  // 初始化硬件定时器，直接设置中断频率
+  // 新版API不再需要定时器编号、分频器和计数方向
+  dacTimer = timerBegin(frequency);
   
-  Serial.println("硬件定时器初始化完成 (200μs精确间隔)");
+  // 将中断服务程序(ISR)附加到定时器
+  // 新版API不再需要第三个参数
+  timerAttachInterrupt(dacTimer, &dacTimerISR);
+  
+  Serial.printf("硬件定时器已初始化，中断频率: %u Hz (每 %d μs)\n", frequency, DAC_UPDATE_INTERVAL_US);
 }
+
 
 void IRAM_ATTR dacTimerISR() {
   // 轻量级ISR，仅发送任务通知
