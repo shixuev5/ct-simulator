@@ -8,7 +8,6 @@
  * - 核心1 (应用核心): 处理测试模式切换、状态打印等非实时任务
  * - 定点数数学: 避免实时路径中的浮点运算
  * 
- * 修正: 兼容ESP32 Arduino Core v3.x+ 的硬件定时器API
  */
 
 #include <Wire.h>
@@ -171,11 +170,9 @@ void initDacTimer() {
   uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
 
   // 初始化硬件定时器，直接设置中断频率
-  // 新版API不再需要定时器编号、分频器和计数方向
   dacTimer = timerBegin(frequency);
   
   // 将中断服务程序(ISR)附加到定时器
-  // 新版API不再需要第三个参数
   timerAttachInterrupt(dacTimer, &dacTimerISR);
   
   Serial.printf("硬件定时器已初始化，中断频率: %u Hz (每 %d μs)\n", frequency, DAC_UPDATE_INTERVAL_US);
@@ -229,7 +226,7 @@ void sineWaveTask(void* parameter) {
     // 更新正弦波索引
     sineIndex = (sineIndex + 1) % SINE_TABLE_SIZE;
     
-    // 生成当前正弦波输出 (优化后的版本)
+    // 生成当前正弦波输出
     generateSineWave();
   }
 }

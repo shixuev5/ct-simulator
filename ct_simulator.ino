@@ -89,12 +89,16 @@ TaskHandle_t sineWaveTaskHandle = NULL;
 // 硬件定时器 (FreeRTOS任务通知方案)
 hw_timer_t * dacTimer = NULL;
 
+// 为中断服务程序(ISR)添加前向声明
+void IRAM_ATTR dacTimerISR();
+
 // 函数声明
 void initHardware();
 void initModbus();
 void initDAC();
 void initSineTable();
 void initDacTimer();                 // 初始化DAC硬件定时器
+void configureDacTimer(uint32_t intervalMicros); // 通用定时器配置函数
 void IRAM_ATTR zeroCrossISR();
 void IRAM_ATTR dacTimerISR();        // DAC定时器中断服务程序
 bool readMeterData();
@@ -215,14 +219,29 @@ void initDAC() {
   Serial.println("MCP4725 DAC初始化完成 (I2C: 400kHz)");
 }
 
-void initDacTimer() {
-  // 初始化硬件定时器用于精确DAC更新时序
-  dacTimer = timerBegin(0, 80, true);  // 定时器0，80分频，向上计数
-  timerAttachInterrupt(dacTimer, &dacTimerISR, true);  // 绑定中断服务程序
-  timerAlarmWrite(dacTimer, DAC_UPDATE_INTERVAL_US, true);  // 设置200μs间隔，自动重载
-  timerAlarmEnable(dacTimer);  // 启用定时器中断
+// 通用定时器配置函数
+void configureDacTimer(uint32_t intervalMicros) {
+  // 计算所需的中断频率
+  uint32_t frequency = 1000000 / intervalMicros;
   
-  Serial.println("硬件定时器初始化完成 (200μs精确间隔)");
+  // 如果定时器已存在，先停止它
+  if (dacTimer != NULL) {
+    timerEnd(dacTimer);
+  }
+  
+  // 初始化硬件定时器，直接设置中断频率
+  dacTimer = timerBegin(frequency);
+  
+  // 将中断服务程序(ISR)附加到定时器
+  timerAttachInterrupt(dacTimer, &dacTimerISR);
+}
+
+// *** FIX: 更新为兼容ESP32 Core v3.x+ 的新版定时器API ***
+void initDacTimer() {
+  configureDacTimer(DAC_UPDATE_INTERVAL_US);
+  
+  uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
+  Serial.printf("硬件定时器已初始化，中断频率: %u Hz (每 %d μs)\n", frequency, DAC_UPDATE_INTERVAL_US);
 }
 
 void IRAM_ATTR dacTimerISR() {
@@ -244,7 +263,9 @@ void IRAM_ATTR zeroCrossISR() {
     if (measuredPeriod > MIN_GRID_PERIOD_MICROS && measuredPeriod < MAX_GRID_PERIOD_MICROS) {
       // 动态调整定时器频率以匹配实际市电频率
       unsigned long newDacInterval = measuredPeriod / SINE_TABLE_SIZE;
-      timerAlarmWrite(dacTimer, newDacInterval, true);
+      
+      // 使用通用函数重新配置定时器
+      configureDacTimer(newDacInterval);
     }
     
     lastZeroCrossTime = now;
