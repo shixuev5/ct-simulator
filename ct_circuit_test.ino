@@ -73,12 +73,12 @@ void setup() {
   Wire.setClock(400000); // 设置I2C为400kHz快速模式
   Serial.println("I2C总线初始化完成 (400kHz)");
   
-  // 初始化MCP4725 DAC (默认I2C地址0x60)
-  if (!dac.begin()) {
+  // 初始化MCP4725 DAC
+  if (!dac.begin(0x60)) {
     Serial.println("❌ MCP4725 DAC初始化失败!");
     Serial.println("请检查:");
     Serial.println("1. MCP4725模块连接是否正确");
-    Serial.println("2. I2C地址是否正确 (默认0x60)");
+    Serial.println("2. I2C地址是否正确");
     Serial.println("3. 电源供电是否正常");
     while (1) {
       delay(1000);

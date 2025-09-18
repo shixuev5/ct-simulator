@@ -78,7 +78,7 @@ void setup() {
   Wire.setClock(400000); // 设置I2C为400kHz快速模式
   
   // 初始化MCP4725 DAC
-  if (!dac.begin()) {
+  if (!dac.begin(0x60)) {
     Serial.println("MCP4725 DAC初始化失败!");
     while (1);
   }
