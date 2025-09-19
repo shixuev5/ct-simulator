@@ -18,7 +18,7 @@
 
 // 系统参数 (注：CT_RATIO仅用于显示，不参与实际计算)
 #define DAC_RESOLUTION 4095 // 12位DAC分辨率
-#define VOLTAGE_REF 5.0     // 参考电压5.0V (MCP4725输出0-5V)
+#define VOLTAGE_REF 4.95    // 参考电压4.95V (MCP4725实际输出范围)
 #define ZERO_OFFSET 2048    // DAC零点偏移值(2.5V)
 #define SINE_TABLE_SIZE 100 // 正弦波查找表大小 (平衡性能和精度)
 #define MAX_CURRENT_A 100   // 最大电流限制100A
@@ -109,7 +109,7 @@ void setup() {
   Serial.println("架构: ESP32双核分离 - 核心0(实时DAC) + 核心1(测试控制)");
   Serial.printf("CT变比: 2000:1\n");
   Serial.printf("最大电流限制: ±%d A\n", MAX_CURRENT_A);
-  Serial.printf("DAC输出范围: 0-5V\n");
+  Serial.printf("DAC输出范围: 0-%.2fV (反相电路模式)\n", VOLTAGE_REF);
   Serial.printf("正弦波查找表: %d 点\n", SINE_TABLE_SIZE);
   Serial.printf("DAC更新频率: %d Hz (每%d μs)\n", 1000000/DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
   Serial.println("开始测试循环...");
@@ -143,15 +143,17 @@ void loop() {
 }
 
 void initSineTable() {
-  // 预计算正弦波查找表
-  Serial.println("生成正弦波查找表...");
+  // 预计算正弦波查找表 (反相电路模式)
+  Serial.println("生成正弦波查找表 (反相电路模式)...");
   
   for (int i = 0; i < SINE_TABLE_SIZE; i++) {
     float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
     float sineValue = sin(angle);
     
-    // 计算对应的DAC电压值 (0-5V范围，2.5V为零点)
-    float outputVoltage = 2.5 + sineValue * 2.5;
+    // *** 反相电路模式: Vout = 5V - 2 * Vin ***
+    // 计算对应的DAC电压值 (0-4.95V范围，2.475V为零点)
+    // 正弦值范围[-1,1]反相映射到电压范围[4.95V,0V]
+    float outputVoltage = (VOLTAGE_REF / 2.0) - sineValue * (VOLTAGE_REF / 2.0);
     
     // 转换为DAC数字值
     sineTable[i] = (uint16_t)((outputVoltage / VOLTAGE_REF) * DAC_RESOLUTION);
@@ -161,7 +163,7 @@ void initSineTable() {
     if (sineTable[i] < 0) sineTable[i] = 0;
   }
   
-  Serial.printf("正弦波查找表生成完成: %d 点\n", SINE_TABLE_SIZE);
+  Serial.printf("正弦波查找表生成完成 (反相电路模式): %d 点\n", SINE_TABLE_SIZE);
 }
 
 // *** FIX: 更新为兼容ESP32 Core v3.x+ 的新版定时器API ***

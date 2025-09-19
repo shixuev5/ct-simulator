@@ -17,7 +17,7 @@
 
 // 系统参数
 #define DAC_RESOLUTION 4095 // 12位DAC分辨率 (0-4095)
-#define VOLTAGE_REF 5.0     // 参考电压5.0V (MCP4725输出0-5V)
+#define VOLTAGE_REF 4.95    // 参考电压4.95V (MCP4725实际输出范围)
 #define ZERO_OFFSET 2048    // DAC零点偏移值(2.5V)
 
 // CT参数
@@ -93,7 +93,7 @@ void setup() {
   Serial.println("");
   Serial.println("=== 系统初始化完成 ===");
   Serial.printf("DAC分辨率: %d 位 (0-%d)\n", 12, DAC_RESOLUTION);
-  Serial.printf("输出电压范围: 0-%.1fV\n", VOLTAGE_REF);
+  Serial.printf("输出电压范围: 0-%.2fV\n", VOLTAGE_REF);
   Serial.printf("模式切换间隔: %d 秒\n", MODE_SWITCH_INTERVAL_MS/1000);
   Serial.printf("CT变比: %d:1\n", CT_RATIO);
   Serial.printf("最大电流限制: ±%d A\n", MAX_CURRENT_A);
@@ -146,8 +146,8 @@ void setTestVoltage(uint8_t mode) {
   Serial.printf("🔧 切换到测试模式 %d: %s\n", mode, testVoltageNames[mode]);
   Serial.printf("📊 DAC数字值: %d (0x%03X)\n", currentDacValue, currentDacValue);
   Serial.printf("⚡ 理论输出: %.3f V\n", actualVoltage);
-  Serial.printf("🔌 模拟电流: %.2f A (CT次级)\n", simulatedCurrent);
-  Serial.printf("📐 等效一次电流: %.2f A\n", simulatedCurrent * CT_RATIO);
+  Serial.printf("🔌 等效一次电流: %.2f A\n", simulatedCurrent);
+  Serial.printf("📐 等效二次电流: %.2f mA\n", simulatedCurrent * 1000 / CT_RATIO);
   Serial.println("📏 请用万用表测量实际输出电压");
   Serial.println("==========================================");
 }
@@ -159,8 +159,8 @@ void printStatus() {
   Serial.printf("📈 当前状态 [模式%d]: %s\n", testMode, testVoltageNames[testMode]);
   Serial.printf("   - DAC数字值: %d / %d (%.1f%%)\n", currentDacValue, DAC_RESOLUTION, percentage);
   Serial.printf("   - 理论电压: %.3f V\n", theoreticalVoltage);
-  Serial.printf("   - 模拟电流: %.2f A (CT次级)\n", simulatedCurrent);
-  Serial.printf("   - 等效一次电流: %.2f A\n", simulatedCurrent * CT_RATIO);
+  Serial.printf("   - 等效一次电流: %.2f A\n", simulatedCurrent);
+  Serial.printf("   - 等效二次电流: %.2f mA\n", simulatedCurrent * 1000 / CT_RATIO);
   Serial.printf("   - 下次切换: %d 秒后\n", (MODE_SWITCH_INTERVAL_MS - (millis() - lastModeSwitch))/1000);
   Serial.println("---");
 }

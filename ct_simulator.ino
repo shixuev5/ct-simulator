@@ -28,7 +28,7 @@
 #define RS485_TX_PIN 17     // RS485发送引脚
 
 #define DAC_RESOLUTION 4095 // 12位DAC分辨率
-#define VOLTAGE_REF 5.0     // 参考电压5.0V (MCP4725输出范围0-5V)
+#define VOLTAGE_REF 4.95    // 参考电压4.95V (MCP4725实际输出范围)
 #define ZERO_OFFSET 2048    // DAC零点偏移值(2.5V)
 #define SINE_TABLE_SIZE 100 // 正弦波查找表大小 (平衡性能和精度)
 #define MAX_CURRENT_A 100   // 最大电流限制100A
@@ -41,7 +41,7 @@
 #define DATA_PRINT_INTERVAL_MS 5000   // 数据打印间隔5秒
 
 // 过零检测参数 (消除魔法数字)
-#define ISR_DEBOUNCE_MICROS 8000     // ISR防抖时间8ms (125Hz)
+#define ISR_DEBOUNCE_MICROS 17000    // ISR防抖时间17ms (约59Hz，低于60Hz)
 #define MIN_GRID_PERIOD_MICROS 16000 // 最小市电周期16ms (62.5Hz)
 #define MAX_GRID_PERIOD_MICROS 25000 // 最大市电周期25ms (40Hz)
 #define MAX_MODBUS_ERRORS 5          // 最大Modbus错误次数
@@ -131,7 +131,7 @@ void setup() {
   Serial.println("=== CT模拟器系统初始化完成 ===");
   Serial.println("架构: ESP32双核分离 - 核心0(实时DAC) + 核心1(Modbus通信)");
   Serial.printf("最大电流限制: ±%d A\n", MAX_CURRENT_A);
-  Serial.printf("DAC输出范围: 0-5V\n");
+  Serial.printf("DAC输出范围: 0-%.2fV (反相电路模式)\n", VOLTAGE_REF);
   Serial.printf("正弦波查找表: %d 点\n", SINE_TABLE_SIZE);
   Serial.printf("DAC更新频率: %d Hz (每%d μs)\n", 1000000/DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
   Serial.printf("默认频率: %.1f Hz (动态同步到实际市电频率)\n", 1000000.0/DEFAULT_PERIOD_MICROS);
@@ -254,7 +254,7 @@ void IRAM_ATTR dacTimerISR() {
 void IRAM_ATTR zeroCrossISR() {
   unsigned long now = micros();
   
-  // 防抖动，最小间隔8ms (对应125Hz，远高于50Hz)
+  // 防抖动，最小间隔17ms (对应约59Hz，略低于60Hz)
   if (now - lastZeroCrossTime > ISR_DEBOUNCE_MICROS) {
     // 计算上一个周期的精确时间
     unsigned long measuredPeriod = now - lastZeroCrossTime;
@@ -382,16 +382,17 @@ void sineWaveTask(void* parameter) {
 
 
 void initSineTable() {
-  // 预计算正弦波查找表，直接生成DAC值
-  Serial.println("生成正弦波查找表...");
+  // 预计算正弦波查找表，直接生成DAC值 (反相电路模式)
+  Serial.println("生成正弦波查找表 (反相电路模式)...");
   
   for (int i = 0; i < SINE_TABLE_SIZE; i++) {
     float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
     float sineValue = sin(angle);
     
-    // 计算对应的DAC电压值 (0-5V范围，2.5V为零点)
-    // 正弦值范围[-1,1]映射到电压范围[0V,5V]
-    float outputVoltage = 2.5 + sineValue * 2.5;
+    // *** 反相电路模式: Vout = 5V - 2 * Vin ***
+    // 计算对应的DAC电压值 (0-4.95V范围，2.475V为零点)
+    // 正弦值范围[-1,1]反相映射到电压范围[4.95V,0V]
+    float outputVoltage = (VOLTAGE_REF / 2.0) - sineValue * (VOLTAGE_REF / 2.0);
     
     // 转换为DAC数字值
     sineTable[i] = (uint16_t)((outputVoltage / VOLTAGE_REF) * DAC_RESOLUTION);
@@ -401,10 +402,10 @@ void initSineTable() {
     if (sineTable[i] < 0) sineTable[i] = 0;
   }
   
-  Serial.println("正弦波查找表初始化完成");
+  Serial.println("正弦波查找表初始化完成 (反相电路模式)");
   Serial.printf("查找表大小: %d 点\n", SINE_TABLE_SIZE);
-  Serial.printf("电压范围: 0-5V\n");
-  Serial.printf("零点DAC值: %d\n", ZERO_OFFSET);
+  Serial.printf("电压范围: 0-%.2fV (反相模式)\n", VOLTAGE_REF);
+  Serial.printf("零点DAC值: %d (%.3fV)\n", ZERO_OFFSET, (VOLTAGE_REF / 2.0));
 }
 
 void generateSineWave() {
