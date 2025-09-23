@@ -115,7 +115,7 @@
 - ✅ **ISR轻量化优化** - 过零检测ISR执行时间<5μs (原180μs)
 - ✅ **延迟更新机制** - 避免ISR阻塞，消除定时器竞争条件
 - ✅ **智能更新阈值** - 50μs阈值过滤，减少99%无效更新
-- ✅ **正向过零同步** - 50Hz相位重置，避免100Hz抖动
+- ✅ **过零同步** - 100Hz脉冲检测，正向过零相位重置
 - ✅ **数据竞争保护** - 临界区确保并发安全
 - ✅ **定点数数学** - 实时路径避免浮点运算
 
@@ -200,7 +200,7 @@ Modbus状态: 连接, 硬件定时器: 启用
 #define DAC_UPDATE_INTERVAL_US 200       // DAC更新间隔200μs (5kHz)
 #define MODBUS_READ_INTERVAL_MS 1000     // Modbus读取间隔1秒
 #define STATUS_PRINT_INTERVAL_MS 3000    // 状态打印间隔3秒
-#define ISR_DEBOUNCE_MICROS 5000         // ISR防抖时间5ms (200Hz，适应100Hz过零频率)
+#define ISR_DEBOUNCE_MICROS 5000         // ISR防抖时间5ms (适应100Hz脉冲频率)
 #define TIMER_UPDATE_THRESHOLD_US 50     // 定时器更新阈值50μs (避免频繁重置)
 #define MIN_GRID_PERIOD_MICROS 16000     // 最小市电周期16ms (62.5Hz)
 #define MAX_GRID_PERIOD_MICROS 25000     // 最大市电周期25ms (40Hz)
@@ -259,7 +259,7 @@ Modbus状态: 连接, 硬件定时器: 启用
 - **过零检测**: 实时测量市电周期 (16-25ms范围验证)
 - **智能更新阈值**: 50μs变化阈值，避免频繁定时器重置
 - **延迟更新机制**: ISR轻量化(<5μs)，主循环安全更新定时器
-- **正向过零同步**: 50Hz相位重置，避免100Hz抖动
+- **过零同步**: 100Hz脉冲检测，正向过零相位重置
 - **任务通知协调**: 即时响应频率变化，延迟<1ms
 - **Fallback机制**: 无过零信号时使用默认50Hz
 
