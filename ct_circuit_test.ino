@@ -17,7 +17,7 @@
 
 // 系统参数
 #define DAC_RESOLUTION 4095 // 12位DAC分辨率 (0-4095)
-#define VOLTAGE_REF 4.95    // 参考电压4.95V (MCP4725实际输出范围)
+#define VOLTAGE_REF 5.0     // 参考电压5.0V (MCP4725输出范围)
 #define ZERO_OFFSET 2048    // DAC零点偏移值(2.5V)
 
 // CT参数
