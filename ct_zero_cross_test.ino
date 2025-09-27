@@ -1,19 +1,3 @@
-/*
- * CT模拟器 - 最终功能完整版 v2.3 (定时器API已修正)
- * 功能: 
- * - 监听50Hz市电过零信号，包含防抖和100Hz脉冲处理。
- * - 通过MCP4725生成同相位的正弦波。
- * - 每30秒自动切换模式，模拟 -22kW, -11kW, 0, 11kW, 22kW 功率。
- * - 动态计算并调整输出正弦波的幅值和相位。
- * - 包含一个安全的中断触发日志，用于调试。
- * - 已适配并正确使用 ESP32 Arduino Core v3.x+ 的定时器API。
- * 
- * 硬件连接:
- * - GPIO4: 过零检测输入 (上升沿触发)
- * - SDA(GPIO21): MCP4725 DAC数据线
- * - SCL(GPIO22): MCP4725 DAC时钟线
- */
-
 #include <Wire.h>
 #include <Adafruit_MCP4725.h>
 #include <math.h>
@@ -133,7 +117,7 @@ void IRAM_ATTR onTimer() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== CT模拟器 - 最终功能完整版 v2.3 (定时器API已修正) ===");
+  Serial.println("\n\n=== CT模拟器 ===");
   Serial.print("测试功率序列: ");
   for(int i=0; i<NUM_TEST_MODES; i++){
     Serial.printf("%.1fkW ", TEST_POWERS[i]/1000.0);
@@ -159,9 +143,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
   Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
 
-  // =====================================================================
-  // ===          采用 v3.x API 的正确设置方法 (关键修正)              ===
-  // =====================================================================
+
   // 1. 初始化定时器，并设置其计数频率为 1MHz (即计数器每 1 微秒加 1)
   dacTimer = timerBegin(1000000); 
   
@@ -170,7 +152,6 @@ void setup() {
   
   // 3. 设置警报：当计数器达到 200 (即 200µs) 时触发中断，并自动重载
   timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US, true, 0);
-  // =====================================================================
 
   Serial.printf("硬件定时器已正确启动，中断频率: %u Hz (每 %d 微秒)\n", 1000000 / DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
   
