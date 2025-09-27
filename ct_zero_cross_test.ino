@@ -162,7 +162,7 @@ void setup() {
   // 使用新的 ESP32 Core v3.x 定时器API
   dacTimer = timerBegin(1000000);
   timerAttachInterrupt(dacTimer, &onTimer);
-  timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US, true, 0);
+  timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US * 1000, true, 0);
   Serial.printf("硬件定时器已正确启动，中断频率: %u Hz (每 %d 微秒)\n", 1000000 / DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
   
   calculateAndApplySettings();
