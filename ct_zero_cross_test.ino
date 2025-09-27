@@ -1,10 +1,12 @@
 /*
- * CT模拟器 - 融合功能版 v2
+ * CT模拟器 - 最终功能完整版 v2.2
  * 功能: 
- * - 监听50Hz市电过零信号 (处理100Hz脉冲)。
+ * - 监听50Hz市电过零信号，包含防抖和100Hz脉冲处理。
  * - 通过MCP4725生成同相位的正弦波。
  * - 每30秒自动切换模式，模拟 -22kW, -11kW, 0, 11kW, 22kW 功率。
  * - 动态计算并调整输出正弦波的幅值和相位。
+ * - 包含一个安全的中断触发日志，用于调试。
+ * - 已适配 ESP32 Arduino Core v3.x+ 的定时器API。
  * 
  * 硬件连接:
  * - GPIO4: 过零检测输入 (上升沿触发)
@@ -28,19 +30,19 @@
 // 50Hz市电固定时序参数
 #define DAC_UPDATE_INTERVAL_US 200 // 50Hz * 100点 = 5kHz更新率
 
-// =========================================================
-// ===             新修改的模拟测试参数                  ===
-// =========================================================
+// 模拟测试参数
 #define MAX_CURRENT_A 100.0   // 22000W / 220V = 100A
 #define TEST_VOLTAGE 220.0    // 假设的市电电压
 #define MODE_SWITCH_INTERVAL_MS 30000 // 模式切换间隔30秒
-#define STATUS_PRINT_INTERVAL_MS 2000 // 状态打印间隔2秒
+#define STATUS_PRINT_INTERVAL_MS 5000 // 状态打印间隔5秒
 
 // 定义不同的测试功率 (单位: W)
 const float TEST_POWERS[] = {-22000.0, -11000.0, 0.0, 11000.0, 22000.0};
 const int NUM_TEST_MODES = sizeof(TEST_POWERS) / sizeof(float);
-// =========================================================
 
+// 过零检测防抖参数
+const unsigned long DEBOUNCE_MICROS = 4000; // 防抖时间4ms
+volatile unsigned long lastZeroCrossTime = 0; // 存储上一次有效触发的时间戳
 
 // 全局对象和变量
 Adafruit_MCP4725 dac;
@@ -49,47 +51,47 @@ hw_timer_t *dacTimer = NULL;
 uint16_t sineTable[SINE_TABLE_SIZE];
 volatile int sineIndex = 0;
 
-// 防抖时间，单位微秒。4ms足以屏蔽噪声，远小于10ms的脉冲间隔。
-const unsigned long DEBOUNCE_MICROS = 4000; 
-// 用于存储上一次有效触发的时间戳
-volatile unsigned long lastZeroCrossTime = 0;
-
 uint8_t testMode = 0;
 float currentPower = TEST_POWERS[0];
 float outputCurrent = 0;
 unsigned long lastModeSwitchTime = 0;
 
+// 主循环与ISR共享的数据
 portMUX_TYPE sharedDataMux = portMUX_INITIALIZER_UNLOCKED;
 volatile float sharedAmplitudeRatio = 0.0;
 volatile bool sharedPhaseInvert = false;
+
+// 用于ISR日志的变量
+volatile long zeroCrossTriggerCount = 0;
+volatile unsigned long lastIsrTimestamp = 0;
+
 
 // 函数声明
 void calculateAndApplySettings();
 void switchTestMode();
 
 /**
- * @brief 过零中断 - 包含防抖和50Hz同步逻辑
+ * @brief 过零中断 (最终版) - 包含防抖、50Hz同步和日志记录
  */
 void IRAM_ATTR onZeroCross() {
   unsigned long now = micros();
 
-  // 检查当前时间与上一次有效触发的时间间隔是否足够长
+  // 步骤1: 防抖检查
   if (now - lastZeroCrossTime < DEBOUNCE_MICROS) {
-    // 时间间隔太短，这很可能是噪声或抖动，直接忽略并返回
-    return;
+    return; // 抖动或噪声，忽略
   }
+  lastZeroCrossTime = now; // 更新有效触发的时间戳
 
-  // 如果程序能执行到这里，说明这是一次有效的、无抖动的触发
-  lastZeroCrossTime = now; // 更新时间戳
-
-  // 使用静态变量来忽略掉100Hz脉冲中的一半，得到50Hz的同步信号
+  // 步骤2: 50Hz同步逻辑 (处理100Hz脉冲)
   static bool ignorePulse = false;
   ignorePulse = !ignorePulse;
-
   if (ignorePulse) {
-    // 只有在不忽略的脉冲上，才重置相位
-    sineIndex = 0;
+    sineIndex = 0; // 在每个完整周期的开始重置相位
   }
+
+  // 步骤3: 安全日志记录 (只做最少的工作)
+  zeroCrossTriggerCount++;
+  lastIsrTimestamp = now;
 }
 
 /**
@@ -131,19 +133,18 @@ void IRAM_ATTR onTimer() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("=== CT模拟器 - 融合功能版 v2.1 (API已更新) ===");
+  Serial.println("\n\n=== CT模拟器 - 最终功能完整版 v2.2 ===");
   Serial.print("测试功率序列: ");
   for(int i=0; i<NUM_TEST_MODES; i++){
     Serial.printf("%.1fkW ", TEST_POWERS[i]/1000.0);
   }
   Serial.println();
 
-
   Wire.begin();
   Wire.setClock(400000); // 设置I2C为400kHz快速模式
 
   if (!dac.begin(0x60)) {
-    Serial.println("错误: MCP4725 DAC未找到!");
+    Serial.println("错误: MCP4725 DAC未找到! 请检查接线。");
     while (1);
   }
   Serial.println("MCP4725 DAC 初始化成功 (快速模式: 400kHz).");
@@ -158,16 +159,10 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
   Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
 
-  // 新的API直接使用频率(Hz)进行初始化。
-  // 我们的更新间隔是200µs，所以频率是 1,000,000 / 200 = 5000 Hz。
+  // 使用新的 ESP32 Core v3.x 定时器API
   const uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
-
-  // 1. 直接用频率初始化定时器。它会自动启动。
   dacTimer = timerBegin(frequency);
-  // 2. 附加中断服务程序。
   timerAttachInterrupt(dacTimer, &onTimer);
-  // =====================================================================
-
   Serial.printf("硬件定时器已启动，中断频率: %u Hz (每 %d 微秒)\n", frequency, DAC_UPDATE_INTERVAL_US);
   
   calculateAndApplySettings();
@@ -177,11 +172,22 @@ void setup() {
 }
 
 void loop() {
+  // 安全的ISR日志输出逻辑
+  static long lastLoggedCount = 0;
+  if (zeroCrossTriggerCount != lastLoggedCount) {
+    long currentCount = zeroCrossTriggerCount;
+    unsigned long triggerTime = lastIsrTimestamp;
+    Serial.printf("[ISR LOG] 过零检测触发! 总次数: %ld, 时间戳: %lu µs\n", currentCount, triggerTime);
+    lastLoggedCount = currentCount;
+  }
+
+  // 模式切换逻辑
   if (millis() - lastModeSwitchTime >= MODE_SWITCH_INTERVAL_MS) {
     lastModeSwitchTime = millis();
     switchTestMode();
   }
   
+  // 定时打印状态信息
   static unsigned long lastPrintTime = 0;
   if (millis() - lastPrintTime > STATUS_PRINT_INTERVAL_MS) {
     lastPrintTime = millis();
