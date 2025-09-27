@@ -154,20 +154,15 @@ void setup() {
     float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
     sineTable[i] = (uint16_t)((sin(angle) + 1.0) * (DAC_RESOLUTION / 2.0));
   }
-
+  
   pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
   Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
 
-  // 1. 初始化定时器，并设置其计数频率为 1MHz (即计数器每 1 微秒加 1)
-  dacTimer = timerBegin(1000000); 
-  
-  // 2. 将 onTimer 中断服务程序附加到定时器
+  // 使用新的 ESP32 Core v3.x 定时器API
+  dacTimer = timerBegin(1000000);
   timerAttachInterrupt(dacTimer, &onTimer);
-  
-  // 3. 设置警报：当计数器达到 200 (即 200µs) 时触发中断，并自动重载
   timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US, true, 0);
-
   Serial.printf("硬件定时器已正确启动，中断频率: %u Hz (每 %d 微秒)\n", 1000000 / DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
   
   calculateAndApplySettings();
