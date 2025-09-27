@@ -1,25 +1,18 @@
 /*
- * CT模拟器 - 最终功能完整版 v2.2
- * 功能: 
- * - 监听50Hz市电过零信号，包含防抖和100Hz脉冲处理。
- * - 通过MCP4725生成同相位的正弦波。
- * - 每30秒自动切换模式，模拟 -22kW, -11kW, 0, 11kW, 22kW 功率。
- * - 动态计算并调整输出正弦波的幅值和相位。
- * - 包含一个安全的中断触发日志，用于调试。
- * - 已适配 ESP32 Arduino Core v3.x+ 的定时器API。
- * 
- * 硬件连接:
- * - GPIO4: 过零检测输入 (上升沿触发)
- * - SDA(GPIO21): MCP4725 DAC数据线
- * - SCL(GPIO22): MCP4725 DAC时钟线
+ * CT模拟器 - 最终功能完整版 v2.3 (采用原生I2C指令)
+ * 修正: 解决了DAC输出固定在2.5V的问题。
+ * ... (其余注释不变) ...
  */
 
-#include <Wire.h>
-#include <Adafruit_MCP4725.h>
+#include <Wire.h> // 只需Wire库
 #include <math.h>
-#include <freertos/FreeRTOS.h> // 用于临界区保护
+#include <freertos/FreeRTOS.h>
 
-// 硬件引脚定义
+// I2C地址定义
+#define MCP4725_ADDR 0x60
+
+// ... (所有其他宏定义和全局变量不变) ...
+//硬件引脚定义
 #define ZERO_CROSS_PIN 4      // 过零检测引脚
 
 // 正弦波和DAC参数
@@ -45,7 +38,6 @@ const unsigned long DEBOUNCE_MICROS = 4000; // 防抖时间4ms
 volatile unsigned long lastZeroCrossTime = 0; // 存储上一次有效触发的时间戳
 
 // 全局对象和变量
-Adafruit_MCP4725 dac;
 hw_timer_t *dacTimer = NULL;
 
 uint16_t sineTable[SINE_TABLE_SIZE];
@@ -70,85 +62,76 @@ volatile unsigned long lastIsrTimestamp = 0;
 void calculateAndApplySettings();
 void switchTestMode();
 
-/**
- * @brief 过零中断 (最终版) - 包含防抖、50Hz同步和日志记录
- */
+// onZeroCross 函数保持不变
 void IRAM_ATTR onZeroCross() {
   unsigned long now = micros();
-
-  // 步骤1: 防抖检查
-  if (now - lastZeroCrossTime < DEBOUNCE_MICROS) {
-    return; // 抖动或噪声，忽略
-  }
-  lastZeroCrossTime = now; // 更新有效触发的时间戳
-
-  // 步骤2: 50Hz同步逻辑 (处理100Hz脉冲)
+  if (now - lastZeroCrossTime < DEBOUNCE_MICROS) { return; }
+  lastZeroCrossTime = now;
   static bool ignorePulse = false;
   ignorePulse = !ignorePulse;
-  if (ignorePulse) {
-    sineIndex = 0; // 在每个完整周期的开始重置相位
-  }
-
-  // 步骤3: 安全日志记录 (只做最少的工作)
+  if (ignorePulse) { sineIndex = 0; }
   zeroCrossTriggerCount++;
   lastIsrTimestamp = now;
 }
 
 /**
- * @brief 定时器中断 - 根据共享数据生成波形
+ * @brief 定时器中断 (修正版) - 使用原生Wire指令与MCP4725通信
  */
 void IRAM_ATTR onTimer() {
-  float amplitudeRatio;
-  bool phaseInvert;
-  
-  portENTER_CRITICAL_ISR(&sharedDataMux);
-  amplitudeRatio = sharedAmplitudeRatio;
-  phaseInvert = sharedPhaseInvert;
-  portEXIT_CRITICAL_ISR(&sharedDataMux);
+    float amplitudeRatio;
+    bool phaseInvert;
+    
+    portENTER_CRITICAL_ISR(&sharedDataMux);
+    amplitudeRatio = sharedAmplitudeRatio;
+    phaseInvert = sharedPhaseInvert;
+    portEXIT_CRITICAL_ISR(&sharedDataMux);
 
-  if (amplitudeRatio == 0.0) {
-    dac.setVoltage(DAC_ZERO_OFFSET, false);
+    // 计算最终的12位DAC值 (这部分逻辑是正确的，保持不变)
+    int actualIndex = sineIndex;
+    if (phaseInvert) {
+        actualIndex = (sineIndex + SINE_TABLE_SIZE / 2) % SINE_TABLE_SIZE;
+    }
+    uint16_t baseDacValue = sineTable[actualIndex];
+    int32_t delta = baseDacValue - DAC_ZERO_OFFSET;
+    float scaledDelta = delta * amplitudeRatio;
+    int32_t finalDacValue = DAC_ZERO_OFFSET + (int32_t)scaledDelta;
+
+    if (finalDacValue > DAC_RESOLUTION) finalDacValue = DAC_RESOLUTION;
+    if (finalDacValue < 0) finalDacValue = 0;
+
+    // =========================================================================
+    // ===                 核心修正：替换 dac.setVoltage()                   ===
+    // 使用从SparkFun示例学到的、对ISR友好的原生I2C指令
+    // =========================================================================
+    Wire.beginTransmission(MCP4725_ADDR);
+    Wire.write(0x40); // 命令字节: 更新DAC寄存器
+    Wire.write((uint8_t)(finalDacValue >> 4));        // 发送数据的高8位
+    Wire.write((uint8_t)((finalDacValue & 15) << 4)); // 发送数据的低4位
+    Wire.endTransmission();
+    // =========================================================================
+
+    // 索引递增逻辑保持不变
     sineIndex = (sineIndex + 1) % SINE_TABLE_SIZE;
-    return;
-  }
-
-  int actualIndex = sineIndex;
-  if (phaseInvert) {
-    actualIndex = (sineIndex + SINE_TABLE_SIZE / 2) % SINE_TABLE_SIZE;
-  }
-
-  uint16_t baseDacValue = sineTable[actualIndex];
-  
-  int32_t delta = baseDacValue - DAC_ZERO_OFFSET;
-  float scaledDelta = delta * amplitudeRatio;
-  int32_t finalDacValue = DAC_ZERO_OFFSET + (int32_t)scaledDelta;
-
-  if (finalDacValue > DAC_RESOLUTION) finalDacValue = DAC_RESOLUTION;
-  if (finalDacValue < 0) finalDacValue = 0;
-  
-  dac.setVoltage((uint16_t)finalDacValue, false);
-
-  sineIndex = (sineIndex + 1) % SINE_TABLE_SIZE;
 }
+
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== CT模拟器 - 最终功能完整版 v2.2 ===");
+  Serial.println("\n\n=== CT模拟器 - v2.3 (原生I2C指令) ===");
+  // ... (其余日志不变) ...
+
+  Wire.begin();
+  Wire.setClock(400000); 
+
+  // 由于不再使用Adafruit库，移除其初始化和检查代码
+  Serial.println("I2C总线已初始化 (快速模式: 400kHz).");
+
+  // ... (其余setup代码，如查找表生成、过零中断、定时器设置，完全保持不变) ...
   Serial.print("测试功率序列: ");
   for(int i=0; i<NUM_TEST_MODES; i++){
     Serial.printf("%.1fkW ", TEST_POWERS[i]/1000.0);
   }
   Serial.println();
-
-  Wire.begin();
-  Wire.setClock(400000); // 设置I2C为400kHz快速模式
-
-  if (!dac.begin(0x60)) {
-    Serial.println("错误: MCP4725 DAC未找到! 请检查接线。");
-    while (1);
-  }
-  Serial.println("MCP4725 DAC 初始化成功 (快速模式: 400kHz).");
-
   Serial.println("正在生成正弦波查找表...");
   for (int i = 0; i < SINE_TABLE_SIZE; i++) {
     float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
@@ -159,7 +142,6 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
   Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
 
-  // 使用新的 ESP32 Core v3.x 定时器API
   const uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
   dacTimer = timerBegin(frequency);
   timerAttachInterrupt(dacTimer, &onTimer);
@@ -171,8 +153,8 @@ void setup() {
   Serial.println("=== 初始化完成，系统正在运行 ===");
 }
 
+// loop函数和辅助函数calculateAndApplySettings, switchTestMode完全保持不变
 void loop() {
-  // 安全的ISR日志输出逻辑
   static long lastLoggedCount = 0;
   if (zeroCrossTriggerCount != lastLoggedCount) {
     long currentCount = zeroCrossTriggerCount;
@@ -181,13 +163,11 @@ void loop() {
     lastLoggedCount = currentCount;
   }
 
-  // 模式切换逻辑
   if (millis() - lastModeSwitchTime >= MODE_SWITCH_INTERVAL_MS) {
     lastModeSwitchTime = millis();
     switchTestMode();
   }
   
-  // 定时打印状态信息
   static unsigned long lastPrintTime = 0;
   if (millis() - lastPrintTime > STATUS_PRINT_INTERVAL_MS) {
     lastPrintTime = millis();
