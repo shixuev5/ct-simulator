@@ -1,3 +1,19 @@
+/*
+ * CT模拟器 - 最终功能完整版 v2.2
+ * 功能: 
+ * - 监听50Hz市电过零信号，包含防抖和100Hz脉冲处理。
+ * - 通过MCP4725生成同相位的正弦波。
+ * - 每30秒自动切换模式，模拟 -22kW, -11kW, 0, 11kW, 22kW 功率。
+ * - 动态计算并调整输出正弦波的幅值和相位。
+ * - 包含一个安全的中断触发日志，用于调试。
+ * - 已适配 ESP32 Arduino Core v3.x+ 的定时器API。
+ * 
+ * 硬件连接:
+ * - GPIO4: 过零检测输入 (上升沿触发)
+ * - SDA(GPIO21): MCP4725 DAC数据线
+ * - SCL(GPIO22): MCP4725 DAC时钟线
+ */
+
 #include <Wire.h>
 #include <Adafruit_MCP4725.h>
 #include <math.h>
@@ -117,7 +133,7 @@ void IRAM_ATTR onTimer() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== CT模拟器 ===");
+  Serial.println("\n\n=== CT模拟器 - 最终功能完整版 v2.2 ===");
   Serial.print("测试功率序列: ");
   for(int i=0; i<NUM_TEST_MODES; i++){
     Serial.printf("%.1fkW ", TEST_POWERS[i]/1000.0);
@@ -138,11 +154,10 @@ void setup() {
     float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
     sineTable[i] = (uint16_t)((sin(angle) + 1.0) * (DAC_RESOLUTION / 2.0));
   }
-  
+
   pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
   Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
-
 
   // 1. 初始化定时器，并设置其计数频率为 1MHz (即计数器每 1 微秒加 1)
   dacTimer = timerBegin(1000000); 
