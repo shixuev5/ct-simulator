@@ -1,77 +1,207 @@
-/*
- * CT模拟器 - 最终功能完整版 v2.2
- * 功能: 
- * - 监听50Hz市电过零信号，包含防抖和100Hz脉冲处理。
- * - 通过MCP4725生成同相位的正弦波。
- * - 每30秒自动切换模式，模拟 -22kW, -11kW, 0, 11kW, 22kW 功率。
- * - 动态计算并调整输出正弦波的幅值和相位。
- * - 包含一个安全的中断触发日志，用于调试。
- * - 已适配 ESP32 Arduino Core v3.x+ 的定时器API。
- * 
- * 硬件连接:
- * - GPIO4: 过零检测输入 (上升沿触发)
- * - SDA(GPIO21): MCP4725 DAC数据线
- * - SCL(GPIO22): MCP4725 DAC时钟线
- */
-
 #include <Wire.h>
 #include <Adafruit_MCP4725.h>
 #include <math.h>
-#include <freertos/FreeRTOS.h> // 用于临界区保护
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // 硬件引脚定义
 #define ZERO_CROSS_PIN 4      // 过零检测引脚
 
-// 正弦波和DAC参数
-#define SINE_TABLE_SIZE 100   // 正弦波查找表大小
-#define DAC_RESOLUTION 4095   // MCP4725是12位DAC
-#define DAC_ZERO_OFFSET 2048  // 12位DAC的中间值 (2.5V)
+// 系统参数
+#define DAC_RESOLUTION 4095 // 12位DAC分辨率
+#define VOLTAGE_REF 5.0     // 参考电压5.0V (MCP4725输出范围)
+#define ZERO_OFFSET 2048    // DAC零点偏移值(2.5V)
+#define SINE_TABLE_SIZE 72  // 正弦波查找表大小 (实测验证最优: 72点)
+#define MAX_CURRENT_A 100   // 最大电流限制100A
 
-// 50Hz市电固定时序参数
-#define DAC_UPDATE_INTERVAL_US 200 // 50Hz * 100点 = 5kHz更新率
-
-// 模拟测试参数
-#define MAX_CURRENT_A 100.0   // 22000W / 220V = 100A
-#define TEST_VOLTAGE 220.0    // 假设的市电电压
-#define MODE_SWITCH_INTERVAL_MS 30000 // 模式切换间隔30秒
+// 系统时序参数 (过零同步模式 - 根据实测频率调整)
+#define DAC_UPDATE_INTERVAL_US 260    // DAC更新间隔260μs (实测验证最优: 72点*260μs=18.72ms周期，实测~50Hz)
 #define STATUS_PRINT_INTERVAL_MS 5000 // 状态打印间隔5秒
+#define MODE_SWITCH_INTERVAL_MS 30000 // 模式切换间隔30秒
 
-// 定义不同的测试功率 (单位: W)
-const float TEST_POWERS[] = {-22000.0, -11000.0, 0.0, 11000.0, 22000.0};
-const int NUM_TEST_MODES = sizeof(TEST_POWERS) / sizeof(float);
+// 定点数数学参数 (优化浮点运算)
+#define AMPLITUDE_SCALE_BITS 10      // 幅值缩放位数 (1024 = 2^10)
+#define AMPLITUDE_SCALE_FACTOR 1024  // 幅值缩放因子 (2^10)
 
 // 过零检测防抖参数
-const unsigned long DEBOUNCE_MICROS = 4000; // 防抖时间4ms
-volatile unsigned long lastZeroCrossTime = 0; // 存储上一次有效触发的时间戳
+#define DEBOUNCE_MICROS 4000 // 防抖时间4ms
 
-// 全局对象和变量
+// 模拟测试参数 (5种功率模式)
+const float TEST_POWERS[] = {-22000.0, -11000.0, 0.0, 11000.0, 22000.0};
+const int NUM_TEST_MODES = sizeof(TEST_POWERS) / sizeof(float);
+#define TEST_VOLTAGE 220      // 测试电压: 220V
+
+// 全局变量
 Adafruit_MCP4725 dac;
-hw_timer_t *dacTimer = NULL;
 
+// 双核任务间共享数据 (需要临界区保护)
+volatile uint16_t sharedAmplitudeScale = 0; // 共享幅值缩放 (定点数)
+volatile bool sharedPhaseInvert = false;    // 共享相位反相标志
+
+// 实时任务专用变量 (核心0)
 uint16_t sineTable[SINE_TABLE_SIZE];
-volatile int sineIndex = 0;
+volatile uint8_t sineIndex = 0;
+uint16_t dacValue = ZERO_OFFSET;
 
-uint8_t testMode = 0;
-float currentPower = TEST_POWERS[0];
-float outputCurrent = 0;
-unsigned long lastModeSwitchTime = 0;
+// 应用任务专用变量 (核心1)
+float currentPower = TEST_POWERS[0];  // 当前功率
+float currentVoltage = TEST_VOLTAGE;  // 当前电压
+float outputCurrent = 0;              // 计算出的电流
+uint8_t testMode = 0;                 // 当前测试模式
+unsigned long lastModeSwitch = 0;
 
-// 主循环与ISR共享的数据
-portMUX_TYPE sharedDataMux = portMUX_INITIALIZER_UNLOCKED;
-volatile float sharedAmplitudeRatio = 0.0;
-volatile bool sharedPhaseInvert = false;
+// 过零检测相关变量
+volatile unsigned long lastZeroCrossTime = 0; // 上一次有效过零触发时间
 
-// 用于ISR日志的变量
-volatile long zeroCrossTriggerCount = 0;
-volatile unsigned long lastIsrTimestamp = 0;
+// 双核同步和互斥锁
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+TaskHandle_t sineWaveTaskHandle = NULL;
 
+// 硬件定时器 (FreeRTOS任务通知方案)
+hw_timer_t * dacTimer = NULL;
 
-// 函数声明
-void calculateAndApplySettings();
-void switchTestMode();
+// 为中断服务程序(ISR)添加前向声明
+void IRAM_ATTR dacTimerISR();
+void IRAM_ATTR onZeroCross();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== CT模拟器过零检测同步版本 (双核架构优化版本) ===");
+  Serial.println("功能: 基于双核架构的过零同步DAC正弦波输出");
+  Serial.print("测试功率序列: ");
+  for(int i=0; i<NUM_TEST_MODES; i++){
+    Serial.printf("%.1fkW ", TEST_POWERS[i]/1000.0);
+  }
+  Serial.println();
+  
+  // 初始化I2C总线
+  Wire.begin();
+  Wire.setClock(400000); // 设置I2C为400kHz快速模式
+  
+  // 初始化MCP4725 DAC
+  if (!dac.begin(0x60)) {
+    Serial.println("MCP4725 DAC初始化失败!");
+    while (1);
+  }
+  Serial.println("MCP4725 DAC初始化完成 (I2C: 400kHz)");
+  
+  // 生成正弦波查找表
+  initSineTable();
+  
+  // 初始化过零检测
+  initZeroCrossDetection();
+  
+  // 计算初始电流并更新共享数据
+  calculateOutputCurrent();
+  updateSharedData();
+  
+  // 创建核心0高优先级实时任务 (专门负责DAC更新)
+  xTaskCreatePinnedToCore(
+    sineWaveTask,           // 任务函数
+    "SineWaveTask",         // 任务名称
+    4096,                   // 堆栈大小
+    NULL,                   // 任务参数
+    configMAX_PRIORITIES-1, // 最高优先级
+    &sineWaveTaskHandle,    // 任务句柄
+    0                       // 绑定到核心0 (实时核心)
+  );
+
+  // 初始化硬件定时器
+  initDacTimer();
+  
+  Serial.println("=== 系统初始化完成 ===");
+  Serial.println("架构: ESP32双核分离 - 核心0(实时DAC) + 核心1(过零检测+测试控制)");
+  Serial.printf("CT变比: 2000:1\n");
+  Serial.printf("最大电流限制: ±%d A\n", MAX_CURRENT_A);
+  Serial.printf("DAC输出范围: 0-%.2fV (正向放大模式)\n", VOLTAGE_REF);
+  Serial.printf("DAC更新频率: %d Hz (每%d μs)\n", 1000000/DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
+  Serial.printf("过零检测引脚: GPIO%d\n", ZERO_CROSS_PIN);
+  Serial.println("开始过零同步测试循环...");
+}
+
+void loop() {
+  static unsigned long lastPrint = 0;
+  
+  // 每5秒打印一次状态
+  if (millis() - lastPrint >= STATUS_PRINT_INTERVAL_MS) {
+    lastPrint = millis();
+    
+    float dacVoltage = (dacValue * VOLTAGE_REF) / DAC_RESOLUTION;
+    
+    Serial.printf("测试状态 [模式%d]:\n", testMode);
+    Serial.printf("- 功率: %.1f W, 电压: %.1f V, 电流: %.1f A\n", 
+                currentPower, currentVoltage, outputCurrent);
+    Serial.printf("- DAC输出: %.2f V, 正弦索引: %d\n", dacVoltage, sineIndex);
+    Serial.printf("- 幅值比例: %.1f%%\n", (abs(outputCurrent) / MAX_CURRENT_A) * 100);
+    
+    // 显示相位信息
+    portENTER_CRITICAL(&timerMux);
+    bool phaseInvert = sharedPhaseInvert;
+    portEXIT_CRITICAL(&timerMux);
+    
+    Serial.printf("- 相位: %s\n", 
+                phaseInvert ? "反相 (180°)" : "正相 (0°)");
+    Serial.println("---");
+  }
+  
+  // 每30秒切换测试模式
+  if (millis() - lastModeSwitch >= MODE_SWITCH_INTERVAL_MS) {
+    lastModeSwitch = millis();
+    switchTestMode();
+  }
+  
+  // 短暂延时，让出CPU给其他任务
+  delay(100);
+}
+
+void initSineTable() {
+  // 预计算正弦波查找表 (正向放大模式)
+  Serial.println("生成正弦波查找表 (正向放大模式)...");
+  
+  for (int i = 0; i < SINE_TABLE_SIZE; i++) {
+    float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
+    float sineValue = sin(angle);
+    
+    // *** 正向放大模式: Vout = 2 * Vin - 5V ***
+    // 计算对应的DAC电压值 (0-5V范围，2.5V为零点)
+    // 正弦值范围[-1,1]映射到电压范围[0V,5V]
+    float outputVoltage = (VOLTAGE_REF / 2.0) + sineValue * (VOLTAGE_REF / 2.0);
+    
+    // 转换为DAC数字值
+    sineTable[i] = (uint16_t)((outputVoltage / VOLTAGE_REF) * DAC_RESOLUTION);
+    
+    // 限制范围
+    if (sineTable[i] > DAC_RESOLUTION) sineTable[i] = DAC_RESOLUTION;
+    if (sineTable[i] < 0) sineTable[i] = 0;
+  }
+  
+  Serial.printf("正弦波查找表生成完成 (正向放大模式): %d 点\n", SINE_TABLE_SIZE);
+}
+
+void initZeroCrossDetection() {
+  // 初始化过零检测引脚和中断
+  pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
+  Serial.printf("过零检测中断已附加到 GPIO%d (上升沿触发)\n", ZERO_CROSS_PIN);
+}
+
+void initDacTimer() {
+  uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
+
+  // 初始化硬件定时器，直接设置中断频率
+  dacTimer = timerBegin(1000000);
+  
+  // 将中断服务程序(ISR)附加到定时器
+  timerAttachInterrupt(dacTimer, &dacTimerISR);
+
+  // 统一配置并启用警报
+  timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US, true, 0);
+  
+  Serial.printf("硬件定时器已初始化，中断频率: %u Hz (每 %d μs)\n", frequency, DAC_UPDATE_INTERVAL_US);
+}
 
 /**
- * @brief 过零中断 (最终版) - 包含防抖、50Hz同步和日志记录
+ * @brief 过零中断处理程序 - 包含防抖、50Hz同步和日志记录
  */
 void IRAM_ATTR onZeroCross() {
   unsigned long now = micros();
@@ -86,142 +216,103 @@ void IRAM_ATTR onZeroCross() {
   static bool ignorePulse = false;
   ignorePulse = !ignorePulse;
   if (ignorePulse) {
-    sineIndex = 0; // 在每个完整周期的开始重置相位
+    // 在每个完整周期的开始重置相位 (直接重置，无需额外同步标志)
+    sineIndex = 0; // 重置正弦波索引到起始点
   }
-
-  // 步骤3: 安全日志记录 (只做最少的工作)
-  zeroCrossTriggerCount++;
-  lastIsrTimestamp = now;
 }
 
-/**
- * @brief 定时器中断 - 根据共享数据生成波形
- */
-void IRAM_ATTR onTimer() {
-  float amplitudeRatio;
-  bool phaseInvert;
-  
-  portENTER_CRITICAL_ISR(&sharedDataMux);
-  amplitudeRatio = sharedAmplitudeRatio;
-  phaseInvert = sharedPhaseInvert;
-  portEXIT_CRITICAL_ISR(&sharedDataMux);
-
-  if (amplitudeRatio == 0.0) {
-    dac.setVoltage(DAC_ZERO_OFFSET, false);
-    sineIndex = (sineIndex + 1) % SINE_TABLE_SIZE;
-    return;
-  }
-
-  int actualIndex = sineIndex;
-  if (phaseInvert) {
-    actualIndex = (sineIndex + SINE_TABLE_SIZE / 2) % SINE_TABLE_SIZE;
-  }
-
-  uint16_t baseDacValue = sineTable[actualIndex];
-  
-  int32_t delta = baseDacValue - DAC_ZERO_OFFSET;
-  float scaledDelta = delta * amplitudeRatio;
-  int32_t finalDacValue = DAC_ZERO_OFFSET + (int32_t)scaledDelta;
-
-  if (finalDacValue > DAC_RESOLUTION) finalDacValue = DAC_RESOLUTION;
-  if (finalDacValue < 0) finalDacValue = 0;
-  
-  dac.setVoltage((uint16_t)finalDacValue, false);
-
-  sineIndex = (sineIndex + 1) % SINE_TABLE_SIZE;
+void IRAM_ATTR dacTimerISR() {
+  // 轻量级ISR，仅发送任务通知
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(sineWaveTaskHandle, &xHigherPriorityTaskWoken);
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\n\n=== CT模拟器 - 最终功能完整版 v2.2 ===");
-  Serial.print("测试功率序列: ");
-  for(int i=0; i<NUM_TEST_MODES; i++){
-    Serial.printf("%.1fkW ", TEST_POWERS[i]/1000.0);
-  }
-  Serial.println();
-
-  Wire.begin();
-  Wire.setClock(400000); // 设置I2C为400kHz快速模式
-
-  if (!dac.begin(0x60)) {
-    Serial.println("错误: MCP4725 DAC未找到! 请检查接线。");
-    while (1);
-  }
-  Serial.println("MCP4725 DAC 初始化成功 (快速模式: 400kHz).");
-
-  Serial.println("正在生成正弦波查找表...");
-  for (int i = 0; i < SINE_TABLE_SIZE; i++) {
-    float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
-    sineTable[i] = (uint16_t)((sin(angle) + 1.0) * (DAC_RESOLUTION / 2.0));
-  }
-  
-  pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
-  Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
-
-  // 使用新的 ESP32 Core v3.x 定时器API
-  dacTimer = timerBegin(1000000);
-  timerAttachInterrupt(dacTimer, &onTimer);
-  timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US * 1000, true, 0);
-  Serial.printf("硬件定时器已正确启动，中断频率: %u Hz (每 %d 微秒)\n", 1000000 / DAC_UPDATE_INTERVAL_US, DAC_UPDATE_INTERVAL_US);
-  
-  calculateAndApplySettings();
-  lastModeSwitchTime = millis();
-  
-  Serial.println("=== 初始化完成，系统正在运行 ===");
-}
-
-void loop() {
-  // 安全的ISR日志输出逻辑
-  static long lastLoggedCount = 0;
-  if (zeroCrossTriggerCount != lastLoggedCount) {
-    long currentCount = zeroCrossTriggerCount;
-    unsigned long triggerTime = lastIsrTimestamp;
-    Serial.printf("[ISR LOG] 过零检测触发! 总次数: %ld, 时间戳: %lu µs\n", currentCount, triggerTime);
-    lastLoggedCount = currentCount;
-  }
-
-  // 模式切换逻辑
-  if (millis() - lastModeSwitchTime >= MODE_SWITCH_INTERVAL_MS) {
-    lastModeSwitchTime = millis();
-    switchTestMode();
-  }
-  
-  // 定时打印状态信息
-  static unsigned long lastPrintTime = 0;
-  if (millis() - lastPrintTime > STATUS_PRINT_INTERVAL_MS) {
-    lastPrintTime = millis();
-    Serial.println("--------------------");
-    Serial.printf("模式: %d, 目标功率: %.1f kW\n", testMode, currentPower / 1000.0);
-    Serial.printf("计算电流: %.2f A\n", outputCurrent);
-    portENTER_CRITICAL(&sharedDataMux);
-    float ratio = sharedAmplitudeRatio;
-    bool invert = sharedPhaseInvert;
-    portEXIT_CRITICAL(&sharedDataMux);
-    Serial.printf("输出幅值比例: %.1f%%\n", ratio * 100.0);
-    Serial.printf("相位: %s\n", invert ? "反相 (180°)" : "正相 (0°)");
-  }
-  
-  delay(10);
-}
-
-void calculateAndApplySettings() {
-  if (TEST_VOLTAGE > 0) {
-    outputCurrent = currentPower / TEST_VOLTAGE;
+void calculateOutputCurrent() {
+  // 根据功率和电压计算电流
+  if (currentVoltage > 0) {
+    outputCurrent = currentPower / currentVoltage;
   } else {
     outputCurrent = 0;
   }
   
-  if (outputCurrent > MAX_CURRENT_A) outputCurrent = MAX_CURRENT_A;
-  if (outputCurrent < -MAX_CURRENT_A) outputCurrent = -MAX_CURRENT_A;
+  // 限制最大电流值为100A
+  if (outputCurrent > MAX_CURRENT_A) {
+    outputCurrent = MAX_CURRENT_A;
+  } else if (outputCurrent < -MAX_CURRENT_A) {
+    outputCurrent = -MAX_CURRENT_A;
+  }
+}
 
-  float ampRatio = abs(outputCurrent) / MAX_CURRENT_A;
-  bool phaseInvert = (currentPower < 0);
+void updateSharedData() {
+  // 计算定点数幅值缩放 (优化浮点运算)
+  float currentAmplitude = abs(outputCurrent);
+  float amplitudeRatio = currentAmplitude / MAX_CURRENT_A; // 0-1比例
+  if (amplitudeRatio > 1.0) amplitudeRatio = 1.0;
+  uint16_t amplitudeScale = (uint16_t)(amplitudeRatio * AMPLITUDE_SCALE_FACTOR);
+  
+  // 使用临界区安全更新共享数据
+  portENTER_CRITICAL(&timerMux);
+  sharedAmplitudeScale = amplitudeScale;
+  sharedPhaseInvert = (currentPower < 0); // 负功率时相位反相
+  portEXIT_CRITICAL(&timerMux);
+}
 
-  portENTER_CRITICAL(&sharedDataMux);
-  sharedAmplitudeRatio = ampRatio;
-  sharedPhaseInvert = phaseInvert;
-  portEXIT_CRITICAL(&sharedDataMux);
+void sineWaveTask(void* parameter) {
+  Serial.println("核心0实时任务启动 - 基于硬件定时器+任务通知的精确DAC更新 (过零同步)");
+  
+  while (true) {
+    // 等待硬件定时器的任务通知 (阻塞等待，无CPU占用)
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    
+    // 更新正弦波索引 (过零中断会直接重置sineIndex，这里只需正常递增)
+    sineIndex = (sineIndex + 1) % SINE_TABLE_SIZE;
+    
+    // 生成当前正弦波输出
+    generateSineWave();
+  }
+}
+
+void generateSineWave() {
+  // 安全读取共享数据 (临界区保护)
+  uint16_t amplitudeScale;
+  bool phaseInvert;
+  
+  portENTER_CRITICAL(&timerMux);
+  amplitudeScale = sharedAmplitudeScale;
+  phaseInvert = sharedPhaseInvert;
+  portEXIT_CRITICAL(&timerMux);
+  
+  // 无功率时输出零点2.5V
+  if (amplitudeScale == 0) {
+    dac.setVoltage(ZERO_OFFSET, false);
+    dacValue = ZERO_OFFSET;
+    return;
+  }
+  
+  // 确定正弦波索引 (负功率时相位反相)
+  uint8_t actualIndex = sineIndex;
+  if (phaseInvert) {
+    // 负功率时相位反相180度
+    actualIndex = (sineIndex + SINE_TABLE_SIZE / 2) % SINE_TABLE_SIZE;
+  }
+  
+  // 从查找表获取基础正弦DAC值
+  uint16_t baseDacValue = sineTable[actualIndex];
+  
+  // 使用定点数数学进行幅值缩放 (避免浮点运算)
+  // scaledValue = ZERO_OFFSET + (baseDacValue - ZERO_OFFSET) * amplitudeScale / 1024
+  int32_t deltaValue = (int32_t)(baseDacValue - ZERO_OFFSET);
+  int32_t scaledDelta = (deltaValue * amplitudeScale) >> AMPLITUDE_SCALE_BITS; // 除以1024
+  int32_t scaledValue = ZERO_OFFSET + scaledDelta;
+  
+  // 限制DAC输出范围
+  if (scaledValue > DAC_RESOLUTION) scaledValue = DAC_RESOLUTION;
+  if (scaledValue < 0) scaledValue = 0;
+  
+  // 更新DAC输出
+  dacValue = (uint16_t)scaledValue;
+  dac.setVoltage(dacValue, false);
 }
 
 void switchTestMode() {
@@ -229,6 +320,8 @@ void switchTestMode() {
   currentPower = TEST_POWERS[testMode];
   
   Serial.println("\n>>> 切换测试模式 <<<");
+  Serial.printf("切换到测试模式%d: %.1f kW\n", testMode, currentPower/1000.0);
   
-  calculateAndApplySettings();
+  calculateOutputCurrent();
+  updateSharedData(); // 更新共享数据供实时任务使用
 }

@@ -20,13 +20,13 @@
 #define DAC_RESOLUTION 4095 // 12位DAC分辨率
 #define VOLTAGE_REF 5.0     // 参考电压5.0V (MCP4725输出范围)
 #define ZERO_OFFSET 2048    // DAC零点偏移值(2.5V)
-#define SINE_TABLE_SIZE 100 // 正弦波查找表大小 (平衡性能和精度)
+#define SINE_TABLE_SIZE 77  // 正弦波查找表大小
 #define MAX_CURRENT_A 100   // 最大电流限制100A
 
 // 系统时序参数 (消除魔法数字)
-#define DAC_UPDATE_INTERVAL_US 200    // DAC更新间隔200μs (50Hz×100点=5kHz)
+#define DAC_UPDATE_INTERVAL_US 260    // DAC更新间隔260μs
 #define STATUS_PRINT_INTERVAL_MS 3000 // 状态打印间隔3秒
-#define MODE_SWITCH_INTERVAL_MS 10000 // 模式切换间隔10秒
+#define MODE_SWITCH_INTERVAL_MS 30000 // 模式切换间隔30秒
 
 // 定点数数学参数 (优化浮点运算)
 #define AMPLITUDE_SCALE_BITS 10      // 幅值缩放位数 (1024 = 2^10)
@@ -87,9 +87,6 @@ void setup() {
   // 生成正弦波查找表
   initSineTable();
   
-  // 初始化硬件定时器
-  initDacTimer();
-  
   // 计算初始电流并更新共享数据
   calculateOutputCurrent();
   updateSharedData();
@@ -104,6 +101,9 @@ void setup() {
     &sineWaveTaskHandle,    // 任务句柄
     0                       // 绑定到核心0 (实时核心)
   );
+
+  // 初始化硬件定时器
+  initDacTimer();
   
   Serial.println("=== 系统初始化完成 ===");
   Serial.println("架构: ESP32双核分离 - 核心0(实时DAC) + 核心1(测试控制)");
@@ -126,13 +126,13 @@ void loop() {
     
     Serial.printf("测试状态 [模式%d]:\n", testMode);
     Serial.printf("- 功率: %.1f W, 电压: %.1f V, 电流: %.1f A\n", 
-                 currentPower, currentVoltage, outputCurrent);
+                currentPower, currentVoltage, outputCurrent);
     Serial.printf("- DAC输出: %.2f V, 正弦索引: %d\n", dacVoltage, sineIndex);
     Serial.printf("- 幅值比例: %.1f%%\n", (abs(outputCurrent) / MAX_CURRENT_A) * 100);
     Serial.println("---");
   }
   
-  // 每10秒切换测试模式
+  // 每30秒切换测试模式
   if (millis() - lastModeSwitch >= MODE_SWITCH_INTERVAL_MS) {
     lastModeSwitch = millis();
     switchTestMode();
@@ -168,14 +168,16 @@ void initSineTable() {
 
 // *** FIX: 更新为兼容ESP32 Core v3.x+ 的新版定时器API ***
 void initDacTimer() {
-  // 计算所需的中断频率。200µs间隔 = 1,000,000 / 200 = 5000 Hz
   uint32_t frequency = 1000000 / DAC_UPDATE_INTERVAL_US;
 
   // 初始化硬件定时器，直接设置中断频率
-  dacTimer = timerBegin(frequency);
+  dacTimer = timerBegin(1000000);
   
   // 将中断服务程序(ISR)附加到定时器
   timerAttachInterrupt(dacTimer, &dacTimerISR);
+
+  // 统一配置并启用警报
+  timerAlarm(dacTimer, DAC_UPDATE_INTERVAL_US, true, 0);
   
   Serial.printf("硬件定时器已初始化，中断频率: %u Hz (每 %d μs)\n", frequency, DAC_UPDATE_INTERVAL_US);
 }
