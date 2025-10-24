@@ -129,7 +129,7 @@ void initDacTimer() {
   uint32_t timer_alarm_us = 1000000U / SAMPLE_RATE_HZ;
   dacTimer = timerBegin(1000000U); // 1MHz 计数频率
   timerAttachInterrupt(dacTimer, &onTimer); // 将onTimer ISR附加到定时器
-  timerAlarmWrite(dacTimer, timer_alarm_us, true, 0); // 设置周期性警报
+  timerAlarm(dacTimer, timer_alarm_us, true, 0); // 设置周期性警报
   Serial.printf("硬件定时器已初始化 (采样率: %u Hz, 间隔: %u us)\n", SAMPLE_RATE_HZ, timer_alarm_us);
 }
 
