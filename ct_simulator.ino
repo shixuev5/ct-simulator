@@ -3,6 +3,9 @@
 #include <ModbusMaster.h>
 #include <Adafruit_MCP4725.h>
 #include <math.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h> // 引入队列库
 
 // =====================================================================
 // == 常量定义
@@ -10,21 +13,20 @@
 
 // --- 硬件引脚定义 ---
 #define ZERO_CROSS_PIN 4      // 过零检测引脚
-#define RS485_RX_PIN 16     // RS485接收引脚
-#define RS485_TX_PIN 17     // RS485发送引脚
+#define RS485_RX_PIN 16       // RS485接收引脚
+#define RS485_TX_PIN 17       // RS485发送引脚
 
 // --- I2C 与 DAC 配置 ---
-const uint32_t I2C_HZ = 1000000;         // I2C时钟频率: 1 MHz (与代码一同步)
-const uint32_t SAMPLE_RATE_HZ = 20000;   // DAC采样率: 20 kHz (与代码一同步)
+const uint32_t I2C_HZ = 400000;         // I2C时钟频率: 400 KHz
+const uint32_t SAMPLE_RATE_HZ = 12800;   // DAC采样率: 20 kHz
 
 // --- DDS 配置 ---
-#define SINE_TABLE_SIZE 256              // 正弦查找表大小, 调整为256以匹配DDS的高效索引
-const float TARGET_FREQ_HZ = 50.0f;    // 目标输出频率
+#define SINE_TABLE_SIZE 256
+const float TARGET_FREQ_HZ = 50.0f;
 
 // --- 系统参数 ---
 #define DAC_RESOLUTION 4095
-#define VOLTAGE_REF 5.0
-#define ZERO_OFFSET 2048
+#define ZERO_OFFSET 2047
 #define MAX_CURRENT_A 100
 
 // --- 定点数数学参数 ---
@@ -41,11 +43,9 @@ const float TARGET_FREQ_HZ = 50.0f;    // 目标输出频率
 // --- Modbus通信参数 ---
 #define MODBUS_SLAVE_ID 1
 #define MODBUS_TIMEOUT_MS 500
-#define MAX_MODBUS_ERRORS 5
 #define MAX_MODBUS_DISCONNECT_ERRORS 10
-// Modbus寄存器地址 (根据DTS5885电表文档)
-#define REG_TOTAL_ACTIVE_POWER 0x52  // 合相有功功率 (82), Signed, 0.01W, 小端字节交换
-#define REG_PHASE_A_VOLTAGE 0x40     // A相电压 (64), Unsigned, 0.01V, 标准大端模式
+#define REG_TOTAL_ACTIVE_POWER 0x52  
+#define REG_PHASE_A_VOLTAGE 0x40     
 
 // =====================================================================
 // == 全局变量与对象
@@ -55,17 +55,21 @@ ModbusMaster modbus;
 Adafruit_MCP4725 dac;
 hw_timer_t* dacTimer = nullptr;
 
+// --- 多任务与队列句柄 ---
+QueueHandle_t dacQueue;         // 核心间的FIFO队列
+TaskHandle_t dacTaskHandle = NULL; // Core 0 任务句柄
+
 // --- DDS 核心变量 ---
 uint16_t sineTable[SINE_TABLE_SIZE];
 volatile uint32_t phase = 0;
 uint32_t phaseStep = 0;
 
-// --- 任务间共享数据 ---
+// --- 任务间共享数据 (Core 1 写, ISR 读) ---
 portMUX_TYPE sharedDataMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint16_t sharedAmplitudeScale = 0;
 volatile bool sharedPhaseInvert = false;
 
-// --- 应用状态变量 ---
+// --- 应用状态变量 (Core 1 本地) ---
 float currentPower = 0.0f;
 float currentVoltage = 220.0f;
 bool modbusConnected = false;
@@ -79,8 +83,28 @@ volatile unsigned long lastZeroCrossTime = 0;
 // =====================================================================
 void IRAM_ATTR onTimer();
 void IRAM_ATTR onZeroCross();
-void updateSharedData(float power);
-bool readMeterData();
+void dacTask(void *parameter); // 新增任务函数
+
+// =====================================================================
+// == 核心 0 专用任务: I2C 发送
+// =====================================================================
+
+/**
+ * @brief 运行在 Core 0 上的高优先级任务
+ * 专门负责从队列取出计算好的数值并写入 DAC
+ */
+void dacTask(void *parameter) {
+  uint16_t valueToSend;
+  
+  // 无限循环，任务永远不应返回
+  for(;;) {
+    // 阻塞等待队列数据 (portMAX_DELAY 表示如果队列空了就无限期挂起等待，不耗CPU)
+    // 一旦 ISR 放入数据，此任务立即被唤醒
+    if (xQueueReceive(dacQueue, &valueToSend, portMAX_DELAY) == pdTRUE) {
+      dac.setVoltage(valueToSend, false);
+    }
+  }
+}
 
 // =====================================================================
 // == 初始化函数 (Setup)
@@ -89,10 +113,12 @@ bool readMeterData();
 void initI2C_DAC() {
   Wire.begin();
   Wire.setClock(I2C_HZ);
+  // 注意：DAC对象在Setup中初始化后，之后只能由 dacTask (Core 0) 访问 setVoltage
   if (!dac.begin(0x60)) {
     Serial.println("错误: MCP4725 DAC未找到!");
     while (1);
   }
+  // 初始设为0点
   dac.setVoltage(ZERO_OFFSET, false);
   Serial.printf("MCP4725 DAC初始化完成 (I2C: %u Hz)\n", I2C_HZ);
 }
@@ -107,15 +133,14 @@ void initModbus() {
 void generateSineTable() {
   for (int i = 0; i < SINE_TABLE_SIZE; i++) {
     float angle = (2.0 * PI * i) / SINE_TABLE_SIZE;
-    // 原始值范围 [-2047.5, 2047.5], 加上偏移后 [0, 4095]
-    sineTable[i] = (uint16_t)roundf(2047.5f + 2047.5f * sinf(angle));
+    sineTable[i] = (uint16_t)roundf(2047.0f + 2047.0f * sinf(angle));
   }
   Serial.printf("正弦波查找表生成完成 (%d 点)\n", SINE_TABLE_SIZE);
 }
 
 void calculatePhaseStep() {
   double ratio = (double)TARGET_FREQ_HZ / (double)SAMPLE_RATE_HZ;
-  phaseStep = (uint32_t)llround(ratio * 4294967296.0); // 2^32
+  phaseStep = (uint32_t)llround(ratio * 4294967296.0); 
   Serial.printf("DDS相位步长已计算 (目标频率: %.1f Hz)\n", TARGET_FREQ_HZ);
 }
 
@@ -125,108 +150,112 @@ void initZeroCrossInterrupt() {
   Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
 }
 
-void initDacTimer() {
-  uint32_t timer_alarm_us = 1000000U / SAMPLE_RATE_HZ;
-  dacTimer = timerBegin(1000000U); // 1MHz 计数频率
-  timerAttachInterrupt(dacTimer, &onTimer); // 将onTimer ISR附加到定时器
-  timerAlarm(dacTimer, timer_alarm_us, true, 0); // 设置周期性警报
-  Serial.printf("硬件定时器已初始化 (采样率: %u Hz, 间隔: %u us)\n", SAMPLE_RATE_HZ, timer_alarm_us);
-}
-
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== CT模拟器 100A/50mA ===");
+  Serial.println("\n=== CT模拟器 (双核架构版) ===");
 
+  // 1. 初始化基础硬件
   initI2C_DAC();
   initModbus();
   generateSineTable();
   calculatePhaseStep();
   initZeroCrossInterrupt();
-  initDacTimer();
 
-  updateSharedData(0.0f);
-  
-  Serial.println("=== 系统初始化完成, 开始运行 ===");
+  // 2. 创建 FreeRTOS 队列
+  // 深度为10足以缓冲ISR和I2C之间的微小抖动
+  dacQueue = xQueueCreate(10, sizeof(uint16_t));
+  if (dacQueue == NULL) {
+    Serial.println("错误: 无法创建队列");
+    while(1);
+  }
+
+  // 3. 创建 Core 0 任务 (DAC 驱动)
+  // 优先级设为 10 (高), 确保 Modbus 或 Wifi 不会打断它
+  xTaskCreatePinnedToCore(
+    dacTask,        // 任务函数
+    "DACTask",      // 任务名称
+    4096,           // 栈大小
+    NULL,           // 参数
+    10,             // 优先级
+    &dacTaskHandle, // 句柄
+    0               // 核心编号 (Core 0)
+  );
+  Serial.println("DAC I2C任务已启动 (Core 0)");
+
+  // 4. 最后启动定时器中断 (ISR 产生数据)
+  uint32_t timer_alarm_us = 1000000U / SAMPLE_RATE_HZ;
+  dacTimer = timerBegin(1000000U); 
+  timerAttachInterrupt(dacTimer, &onTimer);
+  timerAlarm(dacTimer, timer_alarm_us, true, 0);
+  Serial.printf("硬件定时器已启动 (Core 1 ISR -> Queue -> Core 0 Task)\n");
 }
 
 // =====================================================================
-// == 中断服务程序 (ISR) - 已重写
+// == 中断服务程序 (ISR)
 // =====================================================================
 
 void IRAM_ATTR onTimer() {
-  // 1. 更新相位累加器
+  // 1. DDS 计算 (与之前相同)
   phase += phaseStep;
-  
-  // 2. 从相位最高8位计算查找表索引
   uint8_t index = (uint8_t)(phase >> 24);
 
-  // 3. 安全地从主循环获取幅度和相位数据
   portENTER_CRITICAL_ISR(&sharedDataMux);
   uint16_t ampScale = sharedAmplitudeScale;
   bool phaseInvert = sharedPhaseInvert;
   portEXIT_CRITICAL_ISR(&sharedDataMux);
 
-  // 4. 如果幅度为0, 直接输出直流偏置并返回
+  uint16_t finalDacValue;
+
   if (ampScale == 0) {
-    dac.setVoltage(ZERO_OFFSET, false);
-    return;
+    finalDacValue = ZERO_OFFSET;
+  } else {
+    if (phaseInvert) index += (SINE_TABLE_SIZE / 2);
+    
+    uint16_t baseDacValue = sineTable[index];
+    int32_t delta = baseDacValue - ZERO_OFFSET;
+    int32_t scaledDelta = (delta * ampScale) >> AMPLITUDE_SCALE_BITS;
+    int32_t val = ZERO_OFFSET + scaledDelta;
+    
+    if (val < 0) val = 0;
+    else if (val > DAC_RESOLUTION) val = DAC_RESOLUTION;
+    finalDacValue = (uint16_t)val;
   }
+
+  // 2. 发送数据到队列，而不是直接操作 DAC
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   
-  // 5. 如果需要反相, 将索引偏移半个周期
-  if (phaseInvert) {
-    index += (SINE_TABLE_SIZE / 2); // 索引自动回绕 (uint8_t)
+  // 尝试写入队列。如果队列满了(errQUEUE_FULL)，说明I2C太慢处理不过来，
+  // 这里选择丢弃该点而不阻塞ISR，保证中断安全。
+  xQueueSendFromISR(dacQueue, &finalDacValue, &xHigherPriorityTaskWoken);
+
+  // 如果此操作唤醒了高优先级的 dacTask，则请求上下文切换，让 Core 0 立即处理
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
   }
-  
-  // 6. 从查找表获取基准DAC值
-  uint16_t baseDacValue = sineTable[index];
-  
-  // 7. 使用定点数进行幅度缩放 (高性能)
-  int32_t delta = baseDacValue - ZERO_OFFSET;
-  int32_t scaledDelta = (delta * ampScale) >> AMPLITUDE_SCALE_BITS;
-  int32_t finalValue = ZERO_OFFSET + scaledDelta;
-  
-  // 8. 范围限制, 确保输出安全
-  if (finalValue < 0) finalValue = 0;
-  if (finalValue > DAC_RESOLUTION) finalValue = DAC_RESOLUTION;
-  
-  // 9. 设置DAC电压 (使用非阻塞快速写入)
-  dac.setVoltage((uint16_t)finalValue, false);
 }
 
 void IRAM_ATTR onZeroCross() {
   unsigned long now = micros();
-  // 防抖
-  if (now - lastZeroCrossTime < DEBOUNCE_MICROS) {
-    return;
-  }
+  if (now - lastZeroCrossTime < DEBOUNCE_MICROS) return;
   lastZeroCrossTime = now;
   
-  // 市电过零检测通常为100Hz, 我们需要50Hz同步, 所以忽略一半的脉冲
   static bool ignorePulse = false;
   ignorePulse = !ignorePulse;
-  if (ignorePulse) {
-    // 同步DDS相位累加器
-    phase = 0;
-  }
+  if (ignorePulse) phase = 0;
 }
 
-
 // =====================================================================
-// == 主循环与应用逻辑 (Loop)
+// == 主循环 (Core 1 Loop)
 // =====================================================================
 
 void updateSharedData(float power) {
-  // 根据功率计算电流
   float outputCurrent = (currentVoltage > 1.0f) ? (power / currentVoltage) : 0.0f;
   
-  // 限制最大电流
   if (outputCurrent > MAX_CURRENT_A) outputCurrent = MAX_CURRENT_A;
   if (outputCurrent < -MAX_CURRENT_A) outputCurrent = -MAX_CURRENT_A;
 
-  // 计算幅度比例 (0.0 to 1.0)
   float amplitudeRatio = fabsf(outputCurrent) / MAX_CURRENT_A;
   
-  // 使用临界区安全地更新共享给ISR的变量
   portENTER_CRITICAL(&sharedDataMux);
   sharedAmplitudeScale = (uint16_t)(amplitudeRatio * AMPLITUDE_SCALE_FACTOR);
   sharedPhaseInvert = (power < 0);
@@ -236,6 +265,9 @@ void updateSharedData(float power) {
 bool readMeterData() {
   uint8_t result;
   bool success = true;
+  
+  // Modbus 读取可能会阻塞一段时间，但这在 Loop (Core 1) 是安全的，
+  // 因为 DAC 的输出由 Core 0 和 中断 接管了。
   
   // 读取合相有功功率
   result = modbus.readHoldingRegisters(REG_TOTAL_ACTIVE_POWER, 2);
@@ -278,34 +310,36 @@ void printStatus() {
 
     float outputCurrent = (currentVoltage > 1.0f) ? (currentPower / currentVoltage) : 0.0f;
 
-    Serial.println("--- 系统状态 ---");
+    Serial.println("--- 系统状态 (Core 1) ---");
     Serial.printf("- Modbus: %s | 功率: %.2f W | 电压: %.2f V\n", 
                   modbusConnected ? "已连接" : "已断开", currentPower, currentVoltage);
     Serial.printf("- 计算电流: %.2f A\n", outputCurrent);
-    Serial.printf("- DDS 幅度: %u/%u (%.1f%%) | 相位: %s\n", 
-                  ampScale, AMPLITUDE_SCALE_FACTOR, 
-                  (float)ampScale / AMPLITUDE_SCALE_FACTOR * 100.0,
-                  phaseInvert ? "反相(180°)" : "正相(0°)");
+    Serial.printf("- DDS 幅度: %u (%.1f%%) | 相位: %s\n", 
+                  ampScale, (float)ampScale / AMPLITUDE_SCALE_FACTOR * 100.0,
+                  phaseInvert ? "反相" : "正相");
+    
+    // 调试队列状态 (可选): 检查是否有堆积
+    // Serial.printf("- Queue 空闲空间: %d\n", uxQueueSpacesAvailable(dacQueue));
   }
 }
 
 void loop() {
   static unsigned long lastModbusReadTime = 0;
 
-  // 定期读取电表数据
+  // 1. Modbus 通信
+  // 这里的阻塞完全不会影响 Core 0 的 DAC 输出
   if (millis() - lastModbusReadTime >= MODBUS_READ_INTERVAL_MS) {
     lastModbusReadTime = millis();
     if (!readMeterData() && !modbusConnected) {
-      // 如果通信持续失败, 将功率清零
       currentPower = 0.0f;
     }
-    // 根据最新读取或已清零的功率更新DAC输出参数
     updateSharedData(currentPower);
   }
 
-  // 定期打印状态
+  // 2. 状态打印
   printStatus();
 
-  // 短暂延时, 让出CPU给空闲任务
+  // 3. 延时
+  // Core 1 可以自由延时
   delay(10); 
 }

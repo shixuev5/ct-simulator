@@ -4,35 +4,26 @@
 #include <math.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h> // 引入队列库
 
 // =====================================================================
 // == 常量定义
 // =====================================================================
-#define ZERO_CROSS_PIN 4      // 过零检测引脚
+#define ZERO_CROSS_PIN 4
 
 // --- I2C 与 DAC 配置 ---
-const uint32_t I2C_HZ = 1000000;         // I2C时钟频率: 1 MHz
-const uint32_t SAMPLE_RATE_HZ = 20000;   // DAC采样率: 20 kHz
+const uint32_t I2C_HZ = 400000;         // I2C时钟频率: 400 KHz
+const uint32_t SAMPLE_RATE_HZ = 12800;   // DAC采样率: 20 kHz
 
-// --- DDS 配置 ---
+// --- DDS ---
 #define LUT_SIZE 256
 const float TARGET_FREQ_HZ = 50.0f;
 
 // --- 系统参数 ---
 #define DAC_RESOLUTION 4095
-#define VOLTAGE_REF 5.0
-#define ZERO_OFFSET 2048
-
-// --- 定点数数学参数 ---
+#define ZERO_OFFSET 2047
 #define AMPLITUDE_SCALE_BITS 10
 #define AMPLITUDE_SCALE_FACTOR 1024
-
-// --- 模式控制与打印 ---
-#define STATUS_PRINT_INTERVAL_MS 5000
-#define MODE_SWITCH_INTERVAL_MS 30000
-
-// --- 过零检测防抖 ---
-#define DEBOUNCE_MICROS 4000
 
 // --- 模拟测试参数 ---
 const float TEST_POWERS[] = {-22000.0, -11000.0, 0.0, 11000.0, 22000.0};
@@ -41,96 +32,49 @@ const int NUM_TEST_MODES = sizeof(TEST_POWERS) / sizeof(float);
 #define MAX_CURRENT_A 100
 
 // =====================================================================
-// == 全局变量与对象
+// == 全局对象
 // =====================================================================
 Adafruit_MCP4725 dac;
 hw_timer_t* dacTimer = nullptr;
+QueueHandle_t dacQueue; // 定义队列句柄
 
-// --- DDS 核心变量 ---
+// --- 任务句柄 ---
+TaskHandle_t dacTaskHandle = NULL;
+
+// --- DDS 变量 ---
 uint16_t sineLUT[LUT_SIZE];
 volatile uint32_t phase = 0;
 uint32_t phaseStep = 0;
 
-// --- 任务间共享数据 ---
+// --- 共享数据 (Core 1 loop 写, ISR 读) ---
 portMUX_TYPE sharedDataMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint16_t sharedAmplitudeScale = 0;
 volatile bool sharedPhaseInvert = false;
 
-// --- 应用状态变量 ---
+// --- 应用状态 ---
 uint8_t testMode = 0;
-
-// --- 过零检测相关 ---
 volatile unsigned long lastZeroCrossTime = 0;
 
 // =====================================================================
-// == 函数前向声明
-// =====================================================================
-void IRAM_ATTR onTimer();
-void IRAM_ATTR onZeroCross();
-void updateSharedData(float power);
-
-// =====================================================================
-// == 初始化函数 (Setup)
+// == 核心功能函数
 // =====================================================================
 
-void initI2C_DAC() {
-  Wire.begin();
-  Wire.setClock(I2C_HZ);
-  if (!dac.begin(0x60)) {
-    Serial.println("错误: MCP4725 DAC未找到!");
-    while (1);
-  }
-  Serial.printf("MCP4725 DAC初始化完成 (I2C: %u Hz)\n", I2C_HZ);
-}
-
-void generateSineLUT() {
-  for (int i = 0; i < LUT_SIZE; i++) {
-    float angle = (2.0 * PI * i) / LUT_SIZE;
-    sineLUT[i] = (uint16_t)roundf(2047.5f + 2047.5f * sinf(angle));
-  }
-  Serial.printf("正弦波查找表生成完成 (%d 点)\n", LUT_SIZE);
-}
-
-void calculatePhaseStep() {
-  double ratio = (double)TARGET_FREQ_HZ / (double)SAMPLE_RATE_HZ;
-  phaseStep = (uint32_t)llround(ratio * 4294967296.0); // 2^32
-  Serial.printf("DDS相位步长已计算 (目标频率: %.1f Hz)\n", TARGET_FREQ_HZ);
-}
-
-void initZeroCrossInterrupt() {
-  pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
-  Serial.printf("过零检测中断已附加到 GPIO%d\n", ZERO_CROSS_PIN);
-}
-
-void initDacTimer() {
-  uint32_t timer_alarm_us = 1000000U / SAMPLE_RATE_HZ;
-  dacTimer = timerBegin(1000000U); // 1MHz计数频率
-  timerAttachInterrupt(dacTimer, &onTimer);
-  timerAlarm(dacTimer, timer_alarm_us, true, 0);
-  Serial.printf("硬件定时器已初始化 (采样率: %u Hz, 间隔: %u us)\n", SAMPLE_RATE_HZ, timer_alarm_us);
-}
-
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\n=== CT模拟器 - 过零同步版本 ===");
-
-  initI2C_DAC();
-  generateSineLUT();
-  calculatePhaseStep();
-  initZeroCrossInterrupt();
-  initDacTimer();
-
-  // 设置初始工作模式
-  updateSharedData(TEST_POWERS[testMode]);
+// --- Core 0 专用任务: 处理 I2C 发送 ---
+void dacTask(void *parameter) {
+  uint16_t valueToSend;
   
-  Serial.println("=== 系统初始化完成, 开始运行 ===");
+  // 无限循环，类似 loop()
+  for(;;) {
+    // 从队列接收数据
+    // portMAX_DELAY 表示如果队列空了，就一直阻塞等待，不占用CPU资源
+    if (xQueueReceive(dacQueue, &valueToSend, portMAX_DELAY) == pdTRUE) {
+      // 只有收到数据才会执行到这里
+      dac.setVoltage(valueToSend, false);
+    }
+  }
 }
 
-// =====================================================================
-// == 中断服务程序 (ISR)
-// =====================================================================
-
+// --- 中断服务程序 (ISR) ---
 void IRAM_ATTR onTimer() {
   phase += phaseStep;
   uint8_t index = (uint8_t)(phase >> 24);
@@ -140,101 +84,144 @@ void IRAM_ATTR onTimer() {
   bool phaseInvert = sharedPhaseInvert;
   portEXIT_CRITICAL_ISR(&sharedDataMux);
 
+  uint16_t finalDacValue;
+
   if (ampScale == 0) {
-    dac.setVoltage(ZERO_OFFSET, false);
-    return;
+    finalDacValue = ZERO_OFFSET;
+  } else {
+    if (phaseInvert) index += (LUT_SIZE / 2);
+    uint16_t baseDacValue = sineLUT[index];
+    int32_t delta = baseDacValue - ZERO_OFFSET;
+    int32_t scaledDelta = (delta * ampScale) >> AMPLITUDE_SCALE_BITS;
+    int32_t val = ZERO_OFFSET + scaledDelta;
+    
+    if (val < 0) val = 0;
+    else if (val > DAC_RESOLUTION) val = DAC_RESOLUTION;
+    finalDacValue = (uint16_t)val;
   }
+
+  // --- 发送到队列 ---
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  // 将计算好的值发给 Core 0 的任务
+  // 如果队列满了（说明I2C来不及发），这里会丢弃最新的点，保证ISR不阻塞
+  xQueueSendFromISR(dacQueue, &finalDacValue, &xHigherPriorityTaskWoken);
   
-  if (phaseInvert) {
-    index += (LUT_SIZE / 2);
+  // 如果唤醒了高优先级任务（dacTask），进行上下文切换
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
   }
-  
-  uint16_t baseDacValue = sineLUT[index];
-  
-  int32_t delta = baseDacValue - ZERO_OFFSET;
-  int32_t scaledDelta = (delta * ampScale) >> AMPLITUDE_SCALE_BITS;
-  int32_t finalValue = ZERO_OFFSET + scaledDelta;
-  
-  if (finalValue < 0) finalValue = 0;
-  if (finalValue > DAC_RESOLUTION) finalValue = DAC_RESOLUTION;
-  
-  dac.setVoltage((uint16_t)finalValue, false);
 }
 
 void IRAM_ATTR onZeroCross() {
   unsigned long now = micros();
-  if (now - lastZeroCrossTime < DEBOUNCE_MICROS) {
-    return;
-  }
+  if (now - lastZeroCrossTime < 4000) return;
   lastZeroCrossTime = now;
   
-  // 市电过零检测通常为100Hz, 我们需要50Hz同步, 所以忽略一半的脉冲
   static bool ignorePulse = false;
   ignorePulse = !ignorePulse;
-  if (ignorePulse) {
-    // 同步DDS相位累加器
-    phase = 0;
+  if (ignorePulse) phase = 0;
+}
+
+// --- 初始化辅助函数 ---
+void initI2C_DAC() {
+  Wire.begin();
+  Wire.setClock(I2C_HZ);
+  if (!dac.begin(0x60)) {
+    Serial.println("DAC Init Failed");
+    while (1);
+  }
+}
+
+void generateSineLUT() {
+  for (int i = 0; i < LUT_SIZE; i++) {
+    float angle = (2.0 * PI * i) / LUT_SIZE;
+    sineLUT[i] = (uint16_t)roundf(2047.0f + 2047.0f * sinf(angle));
   }
 }
 
 // =====================================================================
-// == 主循环与应用逻辑 (Loop)
+// == Setup & Loop
 // =====================================================================
 
-/**
- * @brief 根据功率计算并安全地更新共享变量 (幅度和相位)
- * @param power 目标功率 (W)
- */
+void setup() {
+  Serial.begin(115200);
+  Serial.println("System Starting...");
+
+  initI2C_DAC();
+  generateSineLUT();
+  
+  // 计算相位步长
+  double ratio = (double)TARGET_FREQ_HZ / (double)SAMPLE_RATE_HZ;
+  phaseStep = (uint32_t)llround(ratio * 4294967296.0);
+
+  // 1. 创建队列：长度为 10，每个单元存储 uint16_t
+  dacQueue = xQueueCreate(10, sizeof(uint16_t));
+  if (dacQueue == NULL) {
+    Serial.println("Error creating queue");
+    while(1);
+  }
+
+  // 2. 创建 Core 0 任务
+  // 参数: 函数名, 任务名, 栈大小, 参数, 优先级, 句柄指针, 核心编号(0)
+  // 优先级设为 10 (高优先级)，确保 I2C 发送优先于其他系统任务
+  xTaskCreatePinnedToCore(
+    dacTask,      
+    "DACTask",    
+    4096,         
+    NULL,         
+    10,           
+    &dacTaskHandle,
+    0             
+  );
+  Serial.println("DAC Task started on Core 0");
+
+  // 3. 设置过零中断
+  pinMode(ZERO_CROSS_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ZERO_CROSS_PIN), onZeroCross, RISING);
+
+  // 4. 启动硬件定时器 (必须最后启动)
+  dacTimer = timerBegin(1000000U);
+  timerAttachInterrupt(dacTimer, &onTimer);
+  timerAlarm(dacTimer, 1000000U / SAMPLE_RATE_HZ, true, 0);
+
+  Serial.println("Timer started");
+}
+
 void updateSharedData(float power) {
-  float outputCurrent = power / TEST_VOLTAGE;
-  if (outputCurrent > MAX_CURRENT_A) outputCurrent = MAX_CURRENT_A;
-  if (outputCurrent < -MAX_CURRENT_A) outputCurrent = -MAX_CURRENT_A;
-  float amplitudeRatio = abs(outputCurrent) / MAX_CURRENT_A;
+  float current = power / TEST_VOLTAGE;
+  if (current > MAX_CURRENT_A) current = MAX_CURRENT_A;
+  if (current < -MAX_CURRENT_A) current = -MAX_CURRENT_A;
   
   portENTER_CRITICAL(&sharedDataMux);
-  sharedAmplitudeScale = (uint16_t)(amplitudeRatio * AMPLITUDE_SCALE_FACTOR);
+  sharedAmplitudeScale = (uint16_t)((abs(current)/MAX_CURRENT_A) * AMPLITUDE_SCALE_FACTOR);
   sharedPhaseInvert = (power < 0);
   portEXIT_CRITICAL(&sharedDataMux);
 }
 
-/**
- * @brief 检查是否需要切换测试模式并执行
- */
-void handleModeSwitch() {
-  static unsigned long lastModeSwitchTime = 0;
-  if (millis() - lastModeSwitchTime >= MODE_SWITCH_INTERVAL_MS) {
-    lastModeSwitchTime = millis();
-    
-    testMode = (testMode + 1) % NUM_TEST_MODES;
-    float newPower = TEST_POWERS[testMode];
-    updateSharedData(newPower);
-    
-    Serial.printf("\n>>> 自动切换到模式 %d: %.1f kW <<<\n", testMode, newPower / 1000.0);
-  }
-}
-
-/**
- * @brief 定期打印当前系统状态
- */
-void printStatus() {
-  static unsigned long lastPrintTime = 0;
-  if (millis() - lastPrintTime >= STATUS_PRINT_INTERVAL_MS) {
-    lastPrintTime = millis();
-    
-    portENTER_CRITICAL(&sharedDataMux);
-    uint16_t ampScale = sharedAmplitudeScale;
-    bool phaseInvert = sharedPhaseInvert;
-    float currentPower = TEST_POWERS[testMode];
-    portEXIT_CRITICAL(&sharedDataMux);
-
-    Serial.printf("--- 状态 [模式%d] ---\n", testMode);
-    Serial.printf("- 功率: %.1f W | 相位: %s\n", currentPower, phaseInvert ? "反相(180°)" : "正相(0°)");
-    Serial.printf("- 幅度: %u/1024 (%.1f%%)\n", ampScale, (float)ampScale / AMPLITUDE_SCALE_FACTOR * 100.0);
-  }
-}
-
 void loop() {
-  handleModeSwitch();
-  printStatus();
-  delay(10); // 短暂延时，让出CPU给空闲任务
+  // --- Core 1 逻辑 ---
+  // 这里是原来的主循环，现在可以随意阻塞、延时、打印，完全不会影响波形输出
+  
+  static unsigned long lastSwitch = 0;
+  static unsigned long lastPrint = 0;
+  
+  // 模式切换逻辑
+  if (millis() - lastSwitch > 30000) {
+    lastSwitch = millis();
+    testMode = (testMode + 1) % NUM_TEST_MODES;
+    updateSharedData(TEST_POWERS[testMode]);
+    Serial.printf("Mode Switched to %d\n", testMode);
+  }
+
+  // 打印逻辑
+  if (millis() - lastPrint > 1000) {
+    lastPrint = millis();
+    Serial.printf("[Core 1] Running... Mode: %d, Power: %.0f\n", testMode, TEST_POWERS[testMode]);
+    // 甚至可以检查 Core 0 任务的状态
+    // UBaseType_t spaces = uxQueueSpacesAvailable(dacQueue);
+    // Serial.printf("Queue spaces: %d\n", spaces);
+  }
+
+  // 适当延时，防止 Core 1 看门狗触发（虽然 Arduino loop 本身有处理）
+  delay(10); 
 }
